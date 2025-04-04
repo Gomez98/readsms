@@ -2,56 +2,53 @@ package com.simplemobiletools.smsmessenger.messaging
 
 import android.app.Application
 import android.app.PendingIntent
+import android.content.Context
 import android.content.Intent
 import android.net.Uri
 import android.telephony.PhoneNumberUtils
+import android.util.Log
 import com.simplemobiletools.commons.helpers.isSPlus
 import com.simplemobiletools.smsmessenger.messaging.SmsException.Companion.EMPTY_DESTINATION_ADDRESS
 import com.simplemobiletools.smsmessenger.messaging.SmsException.Companion.ERROR_SENDING_MESSAGE
 import com.simplemobiletools.smsmessenger.receivers.SendStatusReceiver
 import com.simplemobiletools.smsmessenger.receivers.SmsStatusDeliveredReceiver
 import com.simplemobiletools.smsmessenger.receivers.SmsStatusSentReceiver
+import java.io.File
 
 /** Class that sends chat message via SMS. */
 class SmsSender(val app: Application) {
 
-    // not sure what to do about this yet. this is the default as per android-smsmms
     private val sendMultipartSmsAsSeparateMessages = false
 
-    // This should be called from a RequestWriter queue thread
     fun sendMessage(
-        subId: Int, destination: String, body: String, serviceCenter: String?,
-        requireDeliveryReport: Boolean, messageUri: Uri
+        subId: Int,
+        destination: String,
+        body: String,
+        serviceCenter: String?,
+        requireDeliveryReport: Boolean,
+        messageUri: Uri
     ) {
         var dest = destination
-        if (body.isEmpty()) {
-            throw IllegalArgumentException("SmsSender: empty text message")
-        }
-        // remove spaces and dashes from destination number
-        // (e.g. "801 555 1212" -> "8015551212")
-        // (e.g. "+8211-123-4567" -> "+82111234567")
+        if (body.isEmpty()) throw IllegalArgumentException("SmsSender: empty text message")
         dest = PhoneNumberUtils.stripSeparators(dest)
+        if (dest.isEmpty()) throw SmsException(EMPTY_DESTINATION_ADDRESS)
 
-        if (dest.isEmpty()) {
-            throw SmsException(EMPTY_DESTINATION_ADDRESS)
-        }
-        // Divide the input message by SMS length limit
         val smsManager = getSmsManager(subId)
         val messages = smsManager.divideMessage(body)
-        if (messages == null || messages.size < 1) {
-            throw SmsException(ERROR_SENDING_MESSAGE)
-        }
-        // Actually send the sms
+        if (messages == null || messages.size < 1) throw SmsException(ERROR_SENDING_MESSAGE)
+
         sendInternal(
             subId, dest, messages, serviceCenter, requireDeliveryReport, messageUri
         )
     }
 
-    // Actually sending the message using SmsManager
     private fun sendInternal(
-        subId: Int, dest: String,
-        messages: ArrayList<String>, serviceCenter: String?,
-        requireDeliveryReport: Boolean, messageUri: Uri
+        subId: Int,
+        dest: String,
+        messages: ArrayList<String>,
+        serviceCenter: String?,
+        requireDeliveryReport: Boolean,
+        messageUri: Uri
     ) {
         val smsManager = getSmsManager(subId)
         val messageCount = messages.size
@@ -64,8 +61,8 @@ class SmsSender(val app: Application) {
         }
 
         for (i in 0 until messageCount) {
-            // Make pending intents different for each message part
             val partId = if (messageCount <= 1) 0 else i + 1
+
             if (requireDeliveryReport && i == messageCount - 1) {
                 deliveryIntents.add(
                     PendingIntent.getBroadcast(
@@ -78,6 +75,7 @@ class SmsSender(val app: Application) {
             } else {
                 deliveryIntents.add(null)
             }
+
             sentIntents.add(
                 PendingIntent.getBroadcast(
                     app,
@@ -87,22 +85,19 @@ class SmsSender(val app: Application) {
                 )
             )
         }
+
         try {
+            val context = app.applicationContext
+
             if (sendMultipartSmsAsSeparateMessages) {
-                // If multipart sms is not supported, send them as separate messages
                 for (i in 0 until messageCount) {
-                    smsManager.sendTextMessage(
-                        dest,
-                        serviceCenter,
-                        messages[i],
-                        sentIntents[i],
-                        deliveryIntents[i]
-                    )
+                    val messagePart = messages[i]
+                    smsManager.sendTextMessage(dest, serviceCenter, messagePart, sentIntents[i], deliveryIntents[i])
+                    logSentMessage(context, dest, messagePart)
                 }
             } else {
-                smsManager.sendMultipartTextMessage(
-                    dest, serviceCenter, messages, sentIntents, deliveryIntents
-                )
+                smsManager.sendMultipartTextMessage(dest, serviceCenter, messages, sentIntents, deliveryIntents)
+                logSentMessage(context, dest, messages.joinToString(separator = " "))
             }
         } catch (e: Exception) {
             throw SmsException(ERROR_SENDING_MESSAGE, e)
@@ -128,6 +123,26 @@ class SmsSender(val app: Application) {
                 instance = SmsSender(app)
             }
             return instance!!
+        }
+    }
+
+    private fun logSentMessage(context: Context, destination: String, message: String) {
+        
+        val logText = "ENVIADO A: $destination - Mensaje: $message"
+        logToFileSimple(context, logText)
+    }
+
+    private fun logToFileSimple(context: Context, logText: String) {
+        try {
+            val logFileName = "sms_logs.txt"
+            val file = File(context.getExternalFilesDir(null), logFileName)
+
+            val logEntry = "${System.currentTimeMillis()} - $logText\n"
+            file.appendText(logEntry, Charsets.UTF_8)
+
+            Log.d("LOG_SIMPLE", "Log guardado: ${file.absolutePath}")
+        } catch (e: Exception) {
+            Log.e("LOG_SIMPLE", "Error al guardar log: ${e.message}")
         }
     }
 }

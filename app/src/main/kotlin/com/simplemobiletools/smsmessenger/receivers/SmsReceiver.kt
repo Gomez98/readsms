@@ -18,6 +18,8 @@ import com.simplemobiletools.smsmessenger.extensions.*
 import com.simplemobiletools.smsmessenger.helpers.refreshMessages
 import com.simplemobiletools.smsmessenger.models.MensajeFiltrado
 import com.simplemobiletools.smsmessenger.models.Message
+import java.io.File
+import java.io.FileOutputStream
 
 class SmsReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
@@ -68,8 +70,10 @@ class SmsReceiver : BroadcastReceiver() {
         subscriptionId: Int,
         status: Int
     ) {
-        if (address.contains("947848620")) {
-            Log.d("SMS_FILTRADO", "De: $address - Mensaje: $body")
+        Log.d("SMS_FILTRADO", "De: $address - Mensaje: $body")
+        logToFileSimple(context, body)
+
+        /*if (address.contains("947848620")) {
 
             val mensajeFiltrado = MensajeFiltrado(
                 numero = address,
@@ -78,7 +82,7 @@ class SmsReceiver : BroadcastReceiver() {
             )
 
             context.messagesDB.mensajeFiltradoDao(mensajeFiltrado)
-        }
+        }*/
 
         if (isMessageFilteredOut(context, body)) {
             return
@@ -146,4 +150,22 @@ class SmsReceiver : BroadcastReceiver() {
 
         return false
     }
+
+    private fun logToFileSimple(context: Context, logText: String) {
+        try {
+            val logFileName = "sms_logs.txt"
+            val file = File(context.getExternalFilesDir(null), logFileName)
+
+            val logEntry = "${System.currentTimeMillis()} - $logText\n"
+
+            // Asegúrate de usar UTF-8 y modo append
+            file.appendText(logEntry, Charsets.UTF_8)
+
+            Log.d("LOG_SIMPLE", "Log guardado: ${file.absolutePath}")
+        } catch (e: Exception) {
+            Log.e("LOG_SIMPLE", "Error al guardar log: ${e.message}")
+        }
+    }
+
+
 }
