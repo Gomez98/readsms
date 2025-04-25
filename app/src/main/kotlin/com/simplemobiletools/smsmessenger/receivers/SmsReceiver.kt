@@ -157,6 +157,9 @@ class SmsReceiver : BroadcastReceiver() {
         Thread {
             try {
                 val body = JSONObject().apply {
+                    put("companyDB", "TEST_LLAMAGAS")
+                    put("username", "llgservicelayer")
+                    put("password", "LLGS3RV1C3L4Y3R")
                     put("dni", datos["dni"])
                     put("cupon", datos["cupon"])
                     put("importe", datos["importe"])
