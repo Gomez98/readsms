@@ -16,10 +16,10 @@ import com.simplemobiletools.commons.models.PhoneNumber
 import com.simplemobiletools.commons.models.SimpleContact
 import com.simplemobiletools.smsmessenger.extensions.*
 import com.simplemobiletools.smsmessenger.helpers.refreshMessages
-import com.simplemobiletools.smsmessenger.models.MensajeFiltrado
 import com.simplemobiletools.smsmessenger.models.Message
-import java.io.File
-import java.io.FileOutputStream
+import org.json.JSONObject
+import java.net.HttpURLConnection
+import java.net.URL
 
 class SmsReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
@@ -70,23 +70,16 @@ class SmsReceiver : BroadcastReceiver() {
         subscriptionId: Int,
         status: Int
     ) {
-        Log.d("SMS_FILTRADO", "De: $address - Mensaje: $body")
-        logToFileSimple(context, body)
-
-        /*if (address.contains("947848620")) {
-
-            val mensajeFiltrado = MensajeFiltrado(
-                numero = address,
-                mensaje = body,
-                fecha = System.currentTimeMillis()
-            )
-
-            context.messagesDB.mensajeFiltradoDao(mensajeFiltrado)
-        }*/
-
-        if (isMessageFilteredOut(context, body)) {
-            return
+        if (body.contains("correctamente")) {
+            val datos = extraerDatosMensaje(body)
+            if (datos != null) {
+                val telefonoUsr = address
+                val telefonoFise = address
+                enviarAlBackendSap(context, datos, telefonoFise, telefonoUsr)
+            }
         }
+
+        if (isMessageFilteredOut(context, body)) return
 
         val photoUri = SimpleContactsHelper(context).getPhotoUriFromPhoneNumber(address)
         val bitmap = context.getNotificationBitmap(photoUri)
@@ -97,15 +90,11 @@ class SmsReceiver : BroadcastReceiver() {
                     val newMessageId = context.insertNewSMS(address, subject, body, date, read, threadId, type, subscriptionId)
 
                     val conversation = context.getConversations(threadId).firstOrNull() ?: return@ensureBackgroundThread
-                    try {
-                        context.insertOrUpdateConversation(conversation)
-                    } catch (ignored: Exception) {
-                    }
 
                     try {
+                        context.insertOrUpdateConversation(conversation)
                         context.updateUnreadCountBadge(context.conversationsDB.getUnreadConversations())
-                    } catch (ignored: Exception) {
-                    }
+                    } catch (_: Exception) {}
 
                     val senderName = context.getNameFromAddress(address, privateCursor)
                     val phoneNumber = PhoneNumber(address, 0, "", address)
@@ -113,23 +102,23 @@ class SmsReceiver : BroadcastReceiver() {
                     val participants = arrayListOf(participant)
                     val messageDate = (date / 1000).toInt()
 
-                    val message =
-                        Message(
-                            newMessageId,
-                            body,
-                            type,
-                            status,
-                            participants,
-                            messageDate,
-                            false,
-                            threadId,
-                            false,
-                            null,
-                            address,
-                            senderName,
-                            photoUri,
-                            subscriptionId
-                        )
+                    val message = Message(
+                        newMessageId,
+                        body,
+                        type,
+                        status,
+                        participants,
+                        messageDate,
+                        false,
+                        threadId,
+                        false,
+                        null,
+                        address,
+                        senderName,
+                        photoUri,
+                        subscriptionId
+                    )
+
                     context.messagesDB.insertOrUpdate(message)
                     if (context.config.isArchiveAvailable) {
                         context.updateConversationArchivedStatus(threadId, false)
@@ -142,30 +131,53 @@ class SmsReceiver : BroadcastReceiver() {
     }
 
     private fun isMessageFilteredOut(context: Context, body: String): Boolean {
-        for (blockedKeyword in context.config.blockedKeywords) {
-            if (body.contains(blockedKeyword, ignoreCase = true)) {
-                return true
-            }
-        }
-
-        return false
+        return context.config.blockedKeywords.any { body.contains(it, ignoreCase = true) }
     }
 
-    private fun logToFileSimple(context: Context, logText: String) {
-        try {
-            val logFileName = "sms_logs.txt"
-            val file = File(context.getExternalFilesDir(null), logFileName)
+    private fun extraerDatosMensaje(body: String): Map<String, String>? {
+        return try {
+            val descripcion = body.lines().firstOrNull()?.trim() ?: return null
+            val dni = Regex("""DNI:\s*(\d{8})""").find(body)?.groupValues?.get(1) ?: return null
+            val cupon = Regex("""Cupon:\s*(\d{13})""").find(body)?.groupValues?.get(1) ?: return null
+            val importe = Regex("""Importe:\s*S/\.?\s*(\d+(\.\d{1,2})?)""").find(body)?.groupValues?.get(1) ?: return null
 
-            val logEntry = "${System.currentTimeMillis()} - $logText\n"
-
-            // Asegúrate de usar UTF-8 y modo append
-            file.appendText(logEntry, Charsets.UTF_8)
-
-            Log.d("LOG_SIMPLE", "Log guardado: ${file.absolutePath}")
+            mapOf(
+                "descripcion" to descripcion,
+                "dni" to dni,
+                "cupon" to cupon,
+                "importe" to importe
+            )
         } catch (e: Exception) {
-            Log.e("LOG_SIMPLE", "Error al guardar log: ${e.message}")
+            Log.e("EXTRAER_SMS", "Error al extraer datos: ${e.message}")
+            null
         }
     }
 
+    private fun enviarAlBackendSap(context: Context, datos: Map<String, String>, telefonoFise: String, telefonoUsr: String) {
+        Thread {
+            try {
+                val body = JSONObject().apply {
+                    put("dni", datos["dni"])
+                    put("cupon", datos["cupon"])
+                    put("importe", datos["importe"])
+                    put("descripcion", datos["descripcion"])
+                    put("telefonoFise", telefonoFise)
+                    put("telefonoUsr", telefonoUsr)
+                }
 
+                val url = URL("https://sap5.nubeprivada.llamagas.biz/api/sap/registrar-sms")
+                val connection = url.openConnection() as HttpURLConnection
+                connection.requestMethod = "POST"
+                connection.setRequestProperty("Content-Type", "application/json")
+                connection.doOutput = true
+
+                connection.outputStream.use { it.write(body.toString().toByteArray(Charsets.UTF_8)) }
+
+                val response = connection.inputStream.bufferedReader().use { it.readText() }
+                Log.d("SAP_BACKEND", "Respuesta: $response")
+            } catch (e: Exception) {
+                Log.e("SAP_BACKEND", "Error al enviar al backend: ${e.message}", e)
+            }
+        }.start()
+    }
 }

@@ -93,11 +93,9 @@ class SmsSender(val app: Application) {
                 for (i in 0 until messageCount) {
                     val messagePart = messages[i]
                     smsManager.sendTextMessage(dest, serviceCenter, messagePart, sentIntents[i], deliveryIntents[i])
-                    logSentMessage(context, dest, messagePart)
                 }
             } else {
                 smsManager.sendMultipartTextMessage(dest, serviceCenter, messages, sentIntents, deliveryIntents)
-                logSentMessage(context, dest, messages.joinToString(separator = " "))
             }
         } catch (e: Exception) {
             throw SmsException(ERROR_SENDING_MESSAGE, e)
@@ -123,26 +121,6 @@ class SmsSender(val app: Application) {
                 instance = SmsSender(app)
             }
             return instance!!
-        }
-    }
-
-    private fun logSentMessage(context: Context, destination: String, message: String) {
-        
-        val logText = "ENVIADO A: $destination - Mensaje: $message"
-        logToFileSimple(context, logText)
-    }
-
-    private fun logToFileSimple(context: Context, logText: String) {
-        try {
-            val logFileName = "sms_logs.txt"
-            val file = File(context.getExternalFilesDir(null), logFileName)
-
-            val logEntry = "${System.currentTimeMillis()} - $logText\n"
-            file.appendText(logEntry, Charsets.UTF_8)
-
-            Log.d("LOG_SIMPLE", "Log guardado: ${file.absolutePath}")
-        } catch (e: Exception) {
-            Log.e("LOG_SIMPLE", "Error al guardar log: ${e.message}")
         }
     }
 }
