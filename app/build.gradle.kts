@@ -29,7 +29,7 @@ android {
         targetSdk = project.libs.versions.app.build.targetSDK.get().toInt()
         versionName = project.libs.versions.app.version.versionName.get()
         versionCode = project.libs.versions.app.version.versionCode.get().toInt()
-        buildConfigField("String", "URL_PATH", """${project.property("URL_PATH")}""")
+        
         ksp {
             arg("room.schemaLocation", "$projectDir/schemas")
         }
