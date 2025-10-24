@@ -16,7 +16,8 @@ import com.simplemobiletools.smsmessenger.models.*
     MessageAttachment::class,
     Message::class,
     RecycleBinMessage::class,
-    MensajeFiltrado::class], version = 8)
+    MensajeFiltrado::class,
+    Transaction::class], version = 9)
 @TypeConverters(Converters::class)
 abstract class MessagesDatabase : RoomDatabase() {
 
@@ -29,6 +30,8 @@ abstract class MessagesDatabase : RoomDatabase() {
     abstract fun MessagesDao(): MessagesDao
 
     abstract fun MensajeFiltradoDao(): MensajeFiltradoDao
+
+    abstract fun TransactionDao(): TransactionDao
 
     companion object {
         private var db: MessagesDatabase? = null
@@ -46,6 +49,7 @@ abstract class MessagesDatabase : RoomDatabase() {
                             .addMigrations(MIGRATION_5_6)
                             .addMigrations(MIGRATION_6_7)
                             .addMigrations(MIGRATION_7_8)
+                            .addMigrations(MIGRATION_8_9)
                             .build()
                     }
                 }
@@ -125,6 +129,25 @@ abstract class MessagesDatabase : RoomDatabase() {
                     execSQL("CREATE TABLE IF NOT EXISTS `recycle_bin_messages` (`id` INTEGER NOT NULL PRIMARY KEY, `deleted_ts` INTEGER NOT NULL)")
                     execSQL("CREATE UNIQUE INDEX IF NOT EXISTS `index_recycle_bin_messages_id` ON `recycle_bin_messages` (`id`)")
                 }
+            }
+        }
+
+        private val MIGRATION_8_9 = object : Migration(8, 9) {
+            override fun migrate(database: SupportSQLiteDatabase) {
+                database.execSQL("""
+                    CREATE TABLE transactions (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        driver_phone TEXT NOT NULL,
+                        entidad TEXT NOT NULL,
+                        agente_phone TEXT NOT NULL,
+                        cupon TEXT NOT NULL,
+                        dni TEXT NOT NULL,
+                        fecha TEXT DEFAULT CURRENT_TIMESTAMP,
+                        monto REAL,
+                        estado TEXT,
+                        respuesta TEXT
+                    )
+                """.trimIndent())
             }
         }
     }

@@ -7,6 +7,7 @@ import android.os.Handler
 import android.os.Looper
 import android.provider.Telephony
 import android.util.Log
+import com.google.gson.Gson
 import com.simplemobiletools.commons.extensions.baseConfig
 import com.simplemobiletools.commons.extensions.getMyContactsCursor
 import com.simplemobiletools.commons.extensions.isNumberBlocked
@@ -16,171 +17,405 @@ import com.simplemobiletools.commons.models.PhoneNumber
 import com.simplemobiletools.commons.models.SimpleContact
 import com.simplemobiletools.smsmessenger.extensions.*
 import com.simplemobiletools.smsmessenger.helpers.refreshMessages
-import com.simplemobiletools.smsmessenger.models.Message
+import android.app.Application
+import android.net.Uri
+import com.simplemobiletools.smsmessenger.messaging.SmsSender
+import com.simplemobiletools.smsmessenger.databases.MessagesDatabase
+import com.simplemobiletools.smsmessenger.interfaces.TransactionDao
+import com.simplemobiletools.smsmessenger.BuildConfig
+import com.simplemobiletools.smsmessenger.databases.MessagesDatabase
+import com.simplemobiletools.smsmessenger.interfaces.TransactionDao
+import com.simplemobiletools.smsmessenger.messaging.SmsSender
+import com.simplemobiletools.smsmessenger.models.Agente
+import com.simplemobiletools.smsmessenger.models.AgenteResponse
+import com.simplemobiletools.smsmessenger.models.FISE_SMS
+import com.simplemobiletools.smsmessenger.models.TxStatus
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.withContext
 import org.json.JSONObject
 import java.net.HttpURLConnection
 import java.net.URL
 
 class SmsReceiver : BroadcastReceiver() {
+    private lateinit var smsSender: SmsSender
+    private lateinit var transactionDao: TransactionDao
+    private val job = Job()
+    private val scope = CoroutineScope(Dispatchers.IO + job)
+
     override fun onReceive(context: Context, intent: Intent) {
-        val messages = Telephony.Sms.Intents.getMessagesFromIntent(intent)
-        var address = ""
-        var body = ""
-        var subject = ""
-        var date = 0L
-        var threadId = 0L
-        var status = Telephony.Sms.STATUS_NONE
-        val type = Telephony.Sms.MESSAGE_TYPE_INBOX
-        val read = 0
-        val subscriptionId = intent.getIntExtra("subscription", -1)
-
-        val privateCursor = context.getMyContactsCursor(false, true)
-        ensureBackgroundThread {
-            messages.forEach {
-                address = it.originatingAddress ?: ""
-                subject = it.pseudoSubject
-                status = it.status
-                body += it.messageBody
-                date = System.currentTimeMillis()
-                threadId = context.getThreadId(address)
+        transactionDao = MessagesDatabase.getInstance(context).TransactionDao()
+        smsSender = SmsSender.getInstance(app = context.applicationContext as Application)
+    
+            if (Telephony.Sms.Intents.SMS_DELIVER_ACTION != intent.action) {
+                return
             }
-
-            if (context.baseConfig.blockUnknownNumbers) {
-                val simpleContactsHelper = SimpleContactsHelper(context)
-                simpleContactsHelper.exists(address, privateCursor) { exists ->
-                    if (exists) {
-                        handleMessage(context, address, subject, body, date, read, threadId, type, subscriptionId, status)
-                    }
-                }
-            } else {
-                handleMessage(context, address, subject, body, date, read, threadId, type, subscriptionId, status)
+    
+            val pendingResult = goAsync()
+            val msgs = Telephony.Sms.Intents.getMessagesFromIntent(intent)
+            Log.i(TAG, "📩 SMS_DELIVER recibido (${msgs?.size ?: 0})")
+    
+            if (msgs.isNullOrEmpty()) {
+                Log.w(TAG, "⚠️ Ningún mensaje recibido")
+                pendingResult.finish()
+                return
             }
-        }
-    }
+    
+            scope.launch {
+                try {
+                    msgs.forEach { msg ->
+                        val from = msg.displayOriginatingAddress ?: msg.originatingAddress ?: ""
+                        val body = msg.displayMessageBody ?: msg.messageBody ?: ""
+                        Log.i(TAG, "📩 from=$from body=$body")
 
-    private fun handleMessage(
-        context: Context,
-        address: String,
-        subject: String,
-        body: String,
-        date: Long,
-        read: Int,
-        threadId: Long,
-        type: Int,
-        subscriptionId: Int,
-        status: Int
-    ) {
-        if (body.contains("correctamente")) {
-            val datos = extraerDatosMensaje(body)
-            if (datos != null) {
-                val telefonoUsr = address
-                val telefonoFise = address
-                enviarAlBackendSap(context, datos, telefonoFise, telefonoUsr)
-            }
-        }
-
-        if (isMessageFilteredOut(context, body)) return
-
-        val photoUri = SimpleContactsHelper(context).getPhotoUriFromPhoneNumber(address)
-        val bitmap = context.getNotificationBitmap(photoUri)
-        Handler(Looper.getMainLooper()).post {
-            if (!context.isNumberBlocked(address)) {
-                val privateCursor = context.getMyContactsCursor(favoritesOnly = false, withPhoneNumbersOnly = true)
-                ensureBackgroundThread {
-                    val newMessageId = context.insertNewSMS(address, subject, body, date, read, threadId, type, subscriptionId)
-
-                    val conversation = context.getConversations(threadId).firstOrNull() ?: return@ensureBackgroundThread
-
-                    try {
-                        context.insertOrUpdateConversation(conversation)
-                        context.updateUnreadCountBadge(context.conversationsDB.getUnreadConversations())
-                    } catch (_: Exception) {}
-
-                    val senderName = context.getNameFromAddress(address, privateCursor)
-                    val phoneNumber = PhoneNumber(address, 0, "", address)
-                    val participant = SimpleContact(0, 0, senderName, photoUri, arrayListOf(phoneNumber), ArrayList(), ArrayList())
-                    val participants = arrayListOf(participant)
-                    val messageDate = (date / 1000).toInt()
-
-                    val message = Message(
-                        newMessageId,
-                        body,
-                        type,
-                        status,
-                        participants,
-                        messageDate,
-                        false,
-                        threadId,
-                        false,
-                        null,
-                        address,
-                        senderName,
-                        photoUri,
-                        subscriptionId
-                    )
-
-                    context.messagesDB.insertOrUpdate(message)
-                    if (context.config.isArchiveAvailable) {
-                        context.updateConversationArchivedStatus(threadId, false)
-                    }
-                    refreshMessages()
-                    context.showReceivedMessageNotification(newMessageId, address, body, threadId, bitmap)
-                }
-            }
-        }
-    }
-
-    private fun isMessageFilteredOut(context: Context, body: String): Boolean {
-        return context.config.blockedKeywords.any { body.contains(it, ignoreCase = true) }
-    }
-
-    private fun extraerDatosMensaje(body: String): Map<String, String>? {
-        return try {
-            val descripcion = body.lines().firstOrNull()?.trim() ?: return null
-            val dni = Regex("""DNI:\s*(\d{8})""").find(body)?.groupValues?.get(1) ?: return null
-            val cupon = Regex("""Cupon:\s*(\d{13})""").find(body)?.groupValues?.get(1) ?: return null
-            val importe = Regex("""Importe:\s*S/\.?\s*(\d+(\.\d{1,2})?)""").find(body)?.groupValues?.get(1) ?: return null
-
-            mapOf(
-                "descripcion" to descripcion,
-                "dni" to dni,
-                "cupon" to cupon,
-                "importe" to importe
-            )
-        } catch (e: Exception) {
-            Log.e("EXTRAER_SMS", "Error al extraer datos: ${e.message}")
-            null
-        }
-    }
-
-    private fun enviarAlBackendSap(context: Context, datos: Map<String, String>, telefonoFise: String, telefonoUsr: String) {
-        Thread {
+    
+                                                // Verificar si es mensaje QUE RECIBIMOS ES DE alguien FISE
+                                                val agentes = consultarphone(from)
+                        
+                                                if (!agentes.isNullOrEmpty()) {
+                                                    val agente = agentes.first()
+                        
+                                                    if (!agente.U_LLG_DEALER_PHONE.isNullOrEmpty()) {
+                                                        Log.i(TAG, "📩 dealer=$agente.U_LLG_DEALER_PHONE")
+                                                        // Es un agente FISE, procesamos el mensaje de respuesta de la entidad
+                                                        procesarMensajeFise(context, from, body)
+                                                    }
+        private suspend fun procesarMensajeFise(
+            context: Context,
+            from: String,
+            body: String
+        ) {
+            Log.i(TAG, "📨 Procesando mensaje de FISE")
+    
             try {
-                val body = JSONObject().apply {
-                    put("companyDB", "TEST_LLAMAGAS")
-                    put("username", "llgservicelayer")
-                    put("password", "LLGS3RV1C3L4Y3R")
-                    put("dni", datos["dni"])
-                    put("cupon", datos["cupon"])
-                    put("importe", datos["importe"])
-                    put("descripcion", datos["descripcion"])
-                    put("telefonoFise", telefonoFise)
-                    put("telefonoUsr", telefonoUsr)
+    //            VALIDAMOS QUE TIPO DE STRING ES Y REVISAMOS
+                val parsedBody = extraerDatosMensaje(body)
+    
+                if (parsedBody == null) {
+                    Log.e(TAG, "❌ Error al parsear mensaje de FISE: $body")
+                    return
                 }
-
-                val url = URL("https://sap5.nubeprivada.llamagas.biz/api/sap/registrar-sms")
-                val connection = url.openConnection() as HttpURLConnection
-                connection.requestMethod = "POST"
-                connection.setRequestProperty("Content-Type", "application/json")
-                connection.doOutput = true
-
-                connection.outputStream.use { it.write(body.toString().toByteArray(Charsets.UTF_8)) }
-
-                val response = connection.inputStream.bufferedReader().use { it.readText() }
-                Log.d("SAP_BACKEND", "Respuesta: $response")
+    
+                val code = parsedBody["code"] as? Int ?: -1
+                Log.i(TAG, "codigo status $code")
+                when (code) {
+                    0 -> procesarMensajeValido(context, from, parsedBody)
+                    10 -> { /* procesarMensajeErrado(parsedBody) */ }
+                    20 -> { /* procesarMensajeProcesado(parsedBody) */ }
+                    else -> {
+                        Log.w(TAG, "⚠️ Mensaje no reconocido: ${parsedBody["mensaje"]}")
+                    }
+                }
             } catch (e: Exception) {
-                Log.e("SAP_BACKEND", "Error al enviar al backend: ${e.message}", e)
+                Log.e(TAG, "❌ Error procesando mensaje FISE", e)
             }
-        }.start()
+        }
+    
+        private suspend fun procesarMensajeValido(
+            context: Context,
+            from: String,
+            parsedBody: Map<String, Any>
+        ) {
+            val cupon = parsedBody["cupon"] as? String
+            val dni = parsedBody["dni"] as? String
+            val importe = parsedBody["importe"] as? Double
+            val descripcion = parsedBody["descripcion"] as? String
+    
+            if (cupon.isNullOrBlank() || dni.isNullOrBlank()) {
+                Log.w(TAG, "⚠️ Cupón o DNI vacío en mensaje válido")
+                return
+            }
+    
+            // Buscar transacción existente
+            val transaction = transactionDao.getTxByCuponAndDni(cupon, dni)
+    
+            if (transaction == null) {
+                Log.w(TAG, "⚠️ No se encontró transacción PENDING para cupón=$cupon dni=$dni en la última hora.")
+                return
+            }
+    
+            val agentePhone = transaction.agentePhone
+            val driver_phone = transaction.driverPhone
+            if (agentePhone.isNullOrBlank()) {
+                Log.w(TAG, "⚠️ agente_phone vacío en la transacción de BD")
+                return
+            }
+    
+            // Enviar al backend SAP (en background)
+            val agente = FISE_SMS(
+                U_usr_dni = dni,
+                U_fise_codigo = cupon,
+                U_importe = importe,
+                U_descripcion = descripcion,
+                U_fise_numero = from,
+                U_usr_numero = agentePhone,
+                U_usr_chofer = driver_phone
+            )
+            val sapSentSuccessfully = enviarBackendSap2(agente)
+            if (!sapSentSuccessfully) {
+                Log.e(TAG, "❌ Fallo el envío al backend SAP después de $MAX_RETRIES intentos.")
+                // TODO: Implementar lógica para notificar al usuario o manejar el fallo persistente
+                // Por ejemplo, enviar un SMS al agente informando del fallo.
+                // sendAutoReply(context, agentePhone, "Error: No se pudo procesar su solicitud. Intente de nuevo más tarde.")
+            }
+    
+            // Actualizar BD Sqlite
+            transactionDao.updateTransaction(
+                cupon = cupon,
+                dni = dni,
+                estado = TxStatus.DELIVERED.toString(), // ENVIADO A SAP
+                monto = importe,
+                respuesta = descripcion
+            )
+    
+            // Enviar SMS al agente usando SmsSender
+            val textoChofer = if (importe != null) {
+                "Cupón $cupon validado. Importe por S/ $importe"
+            } else {
+                "Cupón $cupon validado correctamente."
+            }
+    
+            Log.i(TAG, "📤 Enviando a agente $driver_phone: $textoChofer")
+            try {
+                // Asumiendo subId = 0 y Uri.EMPTY para el mensaje de respuesta
+                smsSender.sendMessage(0, driver_phone.toString(), textoChofer, null, false, Uri.EMPTY)
+                // Aquí podrías emitir un SmsEvent si es necesario, similar a sendAutoReply
+                // SmsBus.emit(SmsEvent(from = driver_phone, body = textoChofer, timestamp = System.currentTimeMillis(), direction = SmsDirection.OUT, status = SmsStatus.SENT))
+            } catch (e: Exception) {
+                Log.e(TAG, "❌ Error enviando SMS a $driver_phone con SmsSender", e)
+            }
+        }
+    
+        //    PARSEAR DATOS DE ENTRADA
+        private fun parseCuponDni(body: String): Pair<String?, String?> {
+            val cuponRegex = Regex("""(?i)CUPON[: ]+(\d{6,20})""")
+            val dniRegex = Regex("""(?i)DNI[: ]+(\d{8})""")
+    
+            val cupon = cuponRegex.find(body)?.groupValues?.get(1)
+            val dni = dniRegex.find(body)?.groupValues?.get(1)
+    
+            return cupon to dni
+        }
+    //    mensaje si es de contexto fise
+        private fun extraerDatosMensaje(body: String): Map<String, Any>? {
+            return try {
+                // Caso error: ERRADO
+                if (Regex("""\bERRADO\b""", RegexOption.IGNORE_CASE).containsMatchIn(body)) {
+                    return mapOf(
+                        "code" to 10,
+                        "mensaje" to "Vale ERRADO",
+                        "raw" to body
+                    )
+                }
+    
+                // Caso procesado POR LA ENTIDAD FISE
+    
+                if (Regex("""\bVALE PROCESADO\b""", RegexOption.IGNORE_CASE).containsMatchIn(body)) {
+                    val cupon = body.trim().substringAfterLast(' ')
+    //                val cupon = Regex("CUPON:\s*(\d{10,13})", RegexOption.IGNORE_CASE)
+    //                    .find(body)?.groupValues?.get(1)
+                    val fechaHoraRegex = Regex("""\b(\d{2}/\d{2}/\d{4})\s+([01]?\d|2[0-3]):[0-5]\d\b""")
+                    val match = fechaHoraRegex.find(body)
+                    val fecha = match?.groupValues?.get(1)
+                    val hora = match?.groupValues?.get(2)
+    
+                    return mapOf(
+                        "code" to 20,
+                        "mensaje" to "VALE PROCESADO",
+                        "fecha" to (fecha ?: ""),
+                        "hora" to (hora ?: ""),
+                        "cupon" to cupon,
+                        "raw" to body
+                    )
+                }
+    
+                // Caso válido con Cupon/DNI/Importe
+                val descripcion = body.lines().firstOrNull()?.trim() ?: ""
+                val dni = Regex("""DNI:\s*(\d{8})""").find(body)?.groupValues?.get(1)
+                val cupon = Regex("""CUPON:\s*(\d{10,13})""", RegexOption.IGNORE_CASE)
+                    .find(body)?.groupValues?.get(1)
+    
+                val importeRaw = Regex(
+                    """IMPORTE[:=]?\s*(?:S\s*/\s*\.?\s*)?\s*([0-9]{1,3}(?:[.,]\d{3})*(?:[.,]\d{1,2})|[0-9]+)""",
+                    RegexOption.IGNORE_CASE
+                ).find(body)?.groupValues?.get(1)
+                val importe = importeRaw?.let { normNumber(it) } ?: 0.0
+                if (dni != null && cupon != null) {
+                    return mapOf(
+                        "code" to 0,
+                        "descripcion" to descripcion,
+                        "dni" to dni,
+                        "cupon" to cupon,
+                        "importe" to importe,
+                        "raw" to body,
+                        "mensaje" to "Generacion FISE"
+                    )
+                }
+    
+                // Ningún caso reconocido
+                mapOf(
+                    "code" to -1,
+                    "mensaje" to "No se pudo interpretar",
+                    "raw" to body
+                )
+    
+            } catch (e: Exception) {
+                Log.e(TAG, "❌ Error al extraer datos: ${e.message}", e)
+                null
+            }
+        }
+    
+        private suspend fun enviarBackendSap2(agente: FISE_SMS): Boolean = withContext(Dispatchers.IO) {
+            var success = false
+            var retries = 0
+            val startTime = System.currentTimeMillis()
+            while (!success && retries < MAX_RETRIES) {
+                try {
+                    Log.d(TAG, "Iniciando enviarAlBackendSap, intento ${retries + 1}")
+                    val gson = Gson()
+                    val jsonBody = gson.toJson(agente)
+                    Log.d(TAG, "Cuerpo JSON a enviar: $jsonBody")
+    
+                    val url = URL("$URL_PATH/sl/fise/registrar-sms")
+                    val connection = url.openConnection() as HttpURLConnection
+                    Log.d(TAG, "Conexión abierta a la URL: $url")
+    
+                    connection.apply {
+                        requestMethod = "POST"
+                        setRequestProperty("Content-Type", "application/json")
+                        connectTimeout = 10000
+                        readTimeout = 10000
+                        doOutput = true
+                    }
+                    Log.d(TAG, "Propiedades de la conexión establecidas")
+    
+                    connection.outputStream.use {
+                        it.write(jsonBody.toByteArray(Charsets.UTF_8))
+                    }
+                    Log.d(TAG, "Cuerpo de la solicitud enviado")
+    
+                    val responseCode = connection.responseCode
+                    Log.d(TAG, "Código de respuesta recibido: $responseCode")
+    
+                    val response = if (responseCode == HttpURLConnection.HTTP_OK) {
+                        connection.inputStream.bufferedReader().use { it.readText() }
+                    } else {
+                        connection.errorStream?.bufferedReader()?.use { it.readText() } ?: "Sin respuesta"
+                    }
+    
+                    if (responseCode == HttpURLConnection.HTTP_OK) {
+                        Log.d(TAG, "✅ Backend SAP ($responseCode): $response")
+                        success = true
+                    } else {
+                        Log.e(TAG, "❌ Error al enviar al backend SAP ($responseCode): $response")
+                        retries++
+                        if (retries < MAX_RETRIES) {
+                            Log.w(TAG, "🔄 Reintentando envío al backend SAP (Intento $retries/$MAX_RETRIES)...")
+                            delay(RETRY_DELAY_MS)
+                        }
+                    }
+                } catch (e: Exception) {
+                    Log.e(TAG, "❌ Error al enviar al backend SAP: ${e.message}", e)
+                    retries++
+                    if (retries < MAX_RETRIES) {
+                        Log.w(TAG, "🔄 Reintentando envío al backend SAP (Intento $retries/$MAX_RETRIES)...")
+                        delay(RETRY_DELAY_MS)
+                    }
+                }
+            }
+            val endTime = System.currentTimeMillis()
+            Log.d(TAG, "enviarAlBackendSap finalizado en ${endTime - startTime} ms")
+            return@withContext success
+        }
+
+        private suspend fun consultarphone(phone: String): List<Agente>? {
+            var connection: HttpURLConnection? = null
+            val startTime = System.currentTimeMillis()
+            try {
+                Log.d(TAG, "Iniciando consultarphone para el teléfono: $phone")
+                val nro = phone.replace("+51", "")
+                val filter = "?phone=$nro"
+                val urlString = "$URL_PATH/sl/fise/allAgent$filter"
+                Log.d(TAG, "URL de la API a consultar: $urlString")
+    
+                val url = URL(urlString)
+                connection = url.openConnection() as HttpURLConnection
+                Log.d(TAG, "Conexión abierta a la URL")
+    
+                connection.apply {
+                    requestMethod = "GET"
+                    setRequestProperty("Content-Type", "application/json")
+                    connectTimeout = 10000
+                    readTimeout = 10000
+                    doInput = true
+                }
+                Log.d(TAG, "Propiedades de la conexión establecidas")
+    
+                val code = connection.responseCode
+                Log.d(TAG, "Código de respuesta recibido: $code")
+    
+                if (code == 200) {
+                    val responseBody = connection.inputStream.bufferedReader().use { it.readText() }
+                    Log.d(TAG, "✅ Consulta FISE ($code): $responseBody")
+                    val gson = Gson()
+                    val response = gson.fromJson(responseBody, AgenteResponse::class.java)
+                    return if (response.value.isNotEmpty()) {
+                        Log.i(TAG, "✅ ${response.value.size} Agente(s) FISE encontrado(s) para phone=$nro")
+                        response.value
+                    } else {
+                        Log.w(TAG, "⚠️ No se encontraron agentes FISE para phone=$nro")
+                        null
+                    }
+                } else {
+                    val errorBody = connection.errorStream?.bufferedReader()?.use { it.readText() } ?: ""
+                    Log.e(TAG, "❌ Error en consulta FISE ($code): $errorBody")
+                    return null
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "❌ Error al consultar phone en backend SAP: ${e.message}", e)
+                return null
+            } finally {
+                val endTime = System.currentTimeMillis()
+                Log.d(TAG, "consultarphone finalizado en ${endTime - startTime} ms")
+                connection?.disconnect()
+                Log.d(TAG, "Conexión cerrada")
+            }
+        }
+    
+        /**
+         * Normaliza números con '.' y ',':
+         * - Si contiene ambos, el último separador se asume decimal.
+         * - Si solo contiene ',', se toma como decimal.
+         * - Si solo contiene '.', se toma como decimal.
+         * - Se remueven separadores de miles.
+         */
+        private fun normNumber(s: String): Double {
+            val lastDot = s.lastIndexOf('.')
+            val lastComma = s.lastIndexOf(',')
+            val decimalSep =
+                when {
+                    lastDot == -1 && lastComma == -1 -> null
+                    lastDot > lastComma -> '.'
+                    else -> ','
+                }
+    
+            val clean = if (decimalSep == null) {
+                s.filter { it.isDigit() }
+            } else {
+                val withoutThousands = s.filter { it.isDigit() || it == '.' || it == ',' }
+                    .replace(if (decimalSep == '.') "," else ".", "") // quita el separador “no decimal”
+                withoutThousands.replace(decimalSep, '.')
+            }
+            return clean.toDoubleOrNull() ?: 0.0
+        }
+
+        companion object {
+            private const val TAG = "SmsDeliverReceiver"
+            private const val MAX_RETRIES = 3
+            private const val RETRY_DELAY_MS = 2000L
+        }
     }
-}
+    
