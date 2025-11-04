@@ -7,6 +7,7 @@ import android.content.Intent
 import android.net.Uri
 import android.provider.Telephony
 import android.util.Log
+import android.content.ContentValues
 import com.google.gson.Gson
 import com.simplemobiletools.smsmessenger.BuildConfig
 import com.simplemobiletools.smsmessenger.databases.MessagesDatabase
@@ -58,6 +59,17 @@ class SmsReceiver : BroadcastReceiver() {
                     val from = msg.displayOriginatingAddress ?: msg.originatingAddress ?: ""
                     val body = msg.displayMessageBody ?: msg.messageBody ?: ""
                     Log.i(TAG, "📩 from=$from body=$body")
+
+                    // Save the message to the Telephony provider
+                    val values = ContentValues()
+                    values.put(Telephony.Sms.Inbox.ADDRESS, from)
+                    values.put(Telephony.Sms.Inbox.BODY, body)
+                    values.put(Telephony.Sms.Inbox.DATE, msg.timestampMillis)
+                    values.put(Telephony.Sms.Inbox.READ, 0) // 0 para no leído
+                    context.contentResolver.insert(Telephony.Sms.Inbox.CONTENT_URI, values)
+
+                    // Notify the UI to refresh
+                    org.greenrobot.eventbus.EventBus.getDefault().post(com.simplemobiletools.smsmessenger.models.Events.RefreshMessages())
 
                     // Verificar si es mensaje QUE RECIBIMOS ES DE alguien FISE
                    val agentes = consultarphone(from)
@@ -299,8 +311,7 @@ private fun procesarMensajeErrado(  parsedBody: Map<String, Any>) {
 
         // Enviar SMS al agente usando SmsSender
 //        if (t)
-        val textoChofer = if (!transaction.dni.isNullOrBlank()) { "Cupón $cupon ya fue validado"} else {"Probar otro cupon"
-        }
+        val textoChofer = if (!transaction.dni.isNullOrBlank()) { "Cupón $cupon ya fue validado"} else {"Probar otro cupon"}
 
         Log.i(TAG, "📤 Enviando a agente $driver_phone: $textoChofer")
 
