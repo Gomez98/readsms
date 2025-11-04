@@ -13,13 +13,13 @@ import com.simplemobiletools.smsmessenger.databases.MessagesDatabase
 import com.simplemobiletools.smsmessenger.extensions.*
 import com.simplemobiletools.smsmessenger.interfaces.TransactionDao
 import com.simplemobiletools.smsmessenger.messaging.SmsSender
-import com.simplemobiletools.smsmessenger.models.Agente
-import com.simplemobiletools.smsmessenger.models.AgenteResponse
-import com.simplemobiletools.smsmessenger.models.FISE_SMS
-import com.simplemobiletools.smsmessenger.models.TxStatus
+import com.simplemobiletools.smsmessenger.models.*
 import kotlinx.coroutines.*
 import java.net.HttpURLConnection
 import java.net.URL
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 
 class SmsReceiver : BroadcastReceiver() {
     companion object {
@@ -60,8 +60,8 @@ class SmsReceiver : BroadcastReceiver() {
                     Log.i(TAG, "📩 from=$from body=$body")
 
                     // Verificar si es mensaje QUE RECIBIMOS ES DE alguien FISE
-                    val agentes = consultarphone(from)
-
+                   val agentes = consultarphone(from)
+//                    val dbHelp = LlamagasApp.databaseHelper
                     if (!agentes.isNullOrEmpty()) {
                         val agente = agentes.first()
 
@@ -69,6 +69,10 @@ class SmsReceiver : BroadcastReceiver() {
                             Log.i(TAG, "📩 dealer=$agente.U_LLG_DEALER_PHONE")
                             // Es un agente FISE, procesamos el mensaje de respuesta de la entidad
                             procesarMensajeFise(context, from, body)
+                        } else if (!agente.U_LLG_AGENT_PHONE.isNullOrEmpty()) {
+                            Log.i(TAG, "📩 user=$agente.U_LLG_AGENT_PHONE")
+                            // No es un agente FISE, se asume que es un chofer enviando un cupón
+                            procesarMensajeChofer(context, from, body)
                         }
                     }
                 }
@@ -98,11 +102,8 @@ class SmsReceiver : BroadcastReceiver() {
             Log.i(TAG, "codigo status $code")
             when (code) {
                 0 -> procesarMensajeValido(context, from, parsedBody)
-                10 -> { /* procesarMensajeErrado(parsedBody) */
-                }
-
-                20 -> { /* procesarMensajeProcesado(parsedBody) */
-                }
+                10 ->  procesarMensajeErrado(parsedBody)
+                20 ->  procesarMensajeProcesado(parsedBody)
 
                 else -> {
                     Log.w(TAG, "⚠️ Mensaje no reconocido: ${parsedBody["mensaje"]}")
@@ -113,6 +114,61 @@ class SmsReceiver : BroadcastReceiver() {
         }
     }
 
+    //    RESPUESTA FINAL PARA EL CHOFER O DISTRIBUIDOR
+    private suspend fun procesarMensajeChofer(
+        context: Context,
+        from: String,
+        body: String
+    ) {
+        // Buscar dealer asociado al chofer en servicio API
+        val dealerInfo =
+            getParentDealer(from)
+
+        val phoneDealer = dealerInfo?.U_LLG_DEALER_PHONE
+        val phoneNumber = dealerInfo?.U_LLG_AGENT_PHONE // EL NUMERO DEL SUPERVISOR QUE ENVIA EL SMS A LA ENTIDAD FISE
+
+        Log.i(TAG, "🔎 Dealer encontrado: $phoneDealer")
+
+        if (phoneDealer.isNullOrBlank()) {
+            Log.w(TAG, "⚠️ No hay dealer asociado a $from, no se responde")
+            return
+        }
+
+        if (phoneNumber.isNullOrBlank()) {
+            Log.w(TAG, "⚠️ phoneNumber es null para dealer $phoneDealer")
+            return
+        }
+
+        // Parsear CUPON y DNI del mensaje del chofer
+        val (cupon, dni) = parseCuponDni(body)
+
+        if (cupon.isNullOrBlank() || dni.isNullOrBlank()) {
+            Log.w(TAG, "⚠️ No se pudo parsear CUPON/DNI en body='$body'")
+            return
+        }
+
+        // Enviar auto-respuesta a FISE
+        val replyText = "FISE AH02 $dni $cupon"
+        Log.i(TAG, "📤 Se envía a $phoneDealer: $replyText")
+        try {
+            smsSender.sendMessage(0, phoneDealer, replyText, null, false, Uri.EMPTY)
+        } catch (e: Exception) {
+            Log.e(TAG, "❌ Error enviando SMS a $phoneDealer", e)
+        }
+//        // Persistir transacción como PENDING en SQLITE
+        val transaction = Transaction(
+            driverPhone = from,
+            entidad = phoneDealer,
+            agentePhone = phoneNumber,
+            cupon = cupon,
+            dni = dni,
+            fecha = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.getDefault()).format(Date()),
+            monto = null,
+            estado = TxStatus.PENDING.toString(),
+            respuesta = null
+        )
+        transactionDao.insertOrUpdate(transaction)
+    }
     private suspend fun procesarMensajeValido(
         context: Context,
         from: String,
@@ -170,6 +226,7 @@ class SmsReceiver : BroadcastReceiver() {
             respuesta = descripcion
         )
 
+
         // Enviar SMS al agente usando SmsSender
         val textoChofer = if (importe != null) {
             "Cupón $cupon validado. Importe por S/ $importe"
@@ -188,6 +245,75 @@ class SmsReceiver : BroadcastReceiver() {
         }
     }
 
+//    falta validar segunda respuesta
+private fun procesarMensajeErrado(  parsedBody: Map<String, Any>) {
+    Log.w(TAG, "⚠️ Vale ERRADO recibido: ${parsedBody["raw"]}")
+    // TODO: Implementar lógica para manejar vales errados
+    // Por ejemplo: actualizar estado en BD, notificar al agente, etc.
+
+    // Persistir transacción como PENDING en SQLITE
+//    val transaction = Transaction(
+//        cupon = "0",
+//        dni = "0",
+//        estado = TxStatus.FAILED.toString(),
+//        monto = 0.00,
+//        respuesta = parsedBody["raw"] as? String
+//    )
+//
+//    transactionDao.updateTransaction(transaction)
+
+    try {
+        // Asumiendo subId = 0 y Uri.EMPTY para el mensaje de respuesta
+//        smsSender.sendMessage(0, driver_phone.toString(), textoChofer, null, false, Uri.EMPTY)
+        // Aquí podrías emitir un SmsEvent si es necesario, similar a sendAutoReply
+        // SmsBus.emit(SmsEvent(from = driver_phone, body = textoChofer, timestamp = System.currentTimeMillis(), direction = SmsDirection.OUT, status = SmsStatus.SENT))
+    } catch (e: Exception) {
+        Log.e(TAG, "❌ Error enviando SMS con SmsSender", e)
+    }
+}
+    //falta revisar
+    private fun procesarMensajeProcesado(  parsedBody: Map<String, Any>) {
+        Log.i(TAG, "✅ Vale PROCESADO recibido: ${parsedBody["raw"]}")
+        val cupon = parsedBody["cupon"] as? String
+        val fecha = parsedBody["fecha"] as? String
+        val hora = parsedBody["hora"] as? String
+
+        // TODO: Actualizar estado de la transacción en BD si es necesario
+        Log.i(TAG, "   Cupón: $cupon, Fecha: $fecha, Hora: $hora")
+
+
+        val transaction = cupon?.let { transactionDao.getTxByCuponOnly(it) }
+
+        if (transaction == null) {
+            Log.w(TAG, "⚠️ No se encontró transacción PENDING para cupón=$cupon dni en la última hora.")
+            return
+        }
+
+        val agentePhone = transaction.agentePhone
+        val driver_phone = transaction.driverPhone
+        if (agentePhone.isNullOrBlank()) {
+            Log.w(TAG, "⚠️ agente_phone vacío en la transacción de BD")
+            return
+        }
+
+
+        // Enviar SMS al agente usando SmsSender
+//        if (t)
+        val textoChofer = if (!transaction.dni.isNullOrBlank()) { "Cupón $cupon ya fue validado"} else {"Probar otro cupon"
+        }
+
+        Log.i(TAG, "📤 Enviando a agente $driver_phone: $textoChofer")
+
+        try {
+            // Asumiendo subId = 0 y Uri.EMPTY para el mensaje de respuesta
+            smsSender.sendMessage(0, driver_phone.toString(), textoChofer, null, false, Uri.EMPTY)
+            // Aquí podrías emitir un SmsEvent si es necesario, similar a sendAutoReply
+            // SmsBus.emit(SmsEvent(from = driver_phone, body = textoChofer, timestamp = System.currentTimeMillis(), direction = SmsDirection.OUT, status = SmsStatus.SENT))
+        } catch (e: Exception) {
+            Log.e(TAG, "❌ Error enviando SMS a $driver_phone con SmsSender", e)
+        }
+
+    }
     //    PARSEAR DATOS DE ENTRADA
     private fun parseCuponDni(body: String): Pair<String?, String?> {
         val cuponRegex = Regex("""(?i)CUPON[: ]+(\d{6,20})""")
@@ -380,6 +506,59 @@ class SmsReceiver : BroadcastReceiver() {
         } finally {
             val endTime = System.currentTimeMillis()
             Log.d(TAG, "consultarphone finalizado en ${endTime - startTime} ms")
+            connection?.disconnect()
+            Log.d(TAG, "Conexión cerrada")
+        }
+    }
+    private suspend fun getParentDealer(phone: String): Agente?{
+        var connection: HttpURLConnection? = null
+        val startTime = System.currentTimeMillis()
+        try {
+            Log.d(TAG, "Iniciando getParentDealer para el teléfono: $phone")
+            val nro = phone.replace("+51", "")
+            val filter = "?phone=$nro"
+            val urlString = "$URL_PATH/sl/fise/agentParent$filter"
+            Log.d(TAG, "URL de la API a consultar: $urlString")
+
+            val url = URL(urlString)
+            connection = url.openConnection() as HttpURLConnection
+            Log.d(TAG, "Conexión abierta a la URL")
+
+            connection.apply {
+                requestMethod = "GET"
+                setRequestProperty("Content-Type", "application/json")
+                connectTimeout = 10000
+                readTimeout = 10000
+                doInput = true
+            }
+            Log.d(TAG, "Propiedades de la conexión establecidas")
+
+            val code = connection.responseCode
+            Log.d(TAG, "Código de respuesta recibido: $code")
+
+            if (code == 200) {
+                val responseBody = connection.inputStream.bufferedReader().use { it.readText() }
+                Log.d(TAG, "✅ Consulta FISE ($code): $responseBody")
+                val gson = Gson()
+                val response = gson.fromJson(responseBody, AgenteResponse::class.java)
+                return if (response.value.isNotEmpty()) {
+                    Log.i(TAG, "✅ ${response.value.size} Agente(s) FISE encontrado(s) para phone=$nro")
+                    response.value.firstOrNull()
+                } else {
+                    Log.w(TAG, "⚠️ No se encontraron agentes FISE para phone=$nro")
+                    null
+                }
+            } else {
+                val errorBody = connection.errorStream?.bufferedReader()?.use { it.readText() } ?: ""
+                Log.e(TAG, "❌ Error en consulta FISE ($code): $errorBody")
+                return null
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "❌ Error al consultar phone en backend SAP: ${e.message}", e)
+            return null
+        } finally {
+            val endTime = System.currentTimeMillis()
+            Log.d(TAG, "getParentDealer finalizado en ${endTime - startTime} ms")
             connection?.disconnect()
             Log.d(TAG, "Conexión cerrada")
         }

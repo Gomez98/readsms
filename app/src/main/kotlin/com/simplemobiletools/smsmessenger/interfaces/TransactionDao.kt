@@ -17,4 +17,7 @@ interface TransactionDao {
 
     @Query("SELECT * FROM transactions WHERE cupon = :cupon AND dni = :dni AND estado = 'PENDING' AND fecha >= DATETIME('now','-1 hour') LIMIT 1")
     fun getTxByCuponAndDni(cupon: String, dni: String): Transaction?
+
+    @Query("SELECT * FROM transactions WHERE cupon = :cupon AND estado = 'PENDING' AND fecha >= DATETIME('now','-1 hour') LIMIT 1")
+    fun getTxByCuponOnly(cupon: String): Transaction?
 }
