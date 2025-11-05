@@ -34,7 +34,12 @@ class SmsReceiver : BroadcastReceiver() {
     private lateinit var transactionDao: TransactionDao
     private val job = Job()
     private val scope = CoroutineScope(Dispatchers.IO + job)
-    
+    // 1) Define tu objeto (modelo)
+    data class MsjValidacion(
+        val cupon: String,
+        val dni: String,
+        val code: Int
+    )
     override fun onReceive(context: Context, intent: Intent) {
         transactionDao = MessagesDatabase.getInstance(context).TransactionDao()
         smsSender = SmsSender.getInstance(app = context.applicationContext as Application)
@@ -71,28 +76,62 @@ class SmsReceiver : BroadcastReceiver() {
                     // Notify the UI to refresh
                     org.greenrobot.eventbus.EventBus.getDefault().post(com.simplemobiletools.smsmessenger.models.Events.RefreshMessages())
 
+                    val (cupon,dni,code)  = procesarMensajeValidacion(body)
+                    if (code != -1 || (!cupon.isNullOrBlank() && !dni.isNullOrBlank())  ){
+
                     // Verificar si es mensaje QUE RECIBIMOS ES DE alguien FISE
                    val agentes = consultarphone(from)
-//                    val dbHelp = LlamagasApp.databaseHelper
-                    if (!agentes.isNullOrEmpty()) {
-                        val agente = agentes.first()
-
-                        if (!agente.U_LLG_DEALER_PHONE.isNullOrEmpty()) {
-                            Log.i(TAG, "📩 dealer=$agente.U_LLG_DEALER_PHONE")
-                            // Es un agente FISE, procesamos el mensaje de respuesta de la entidad
-                            procesarMensajeFise(context, from, body)
-                        } else if (!agente.U_LLG_AGENT_PHONE.isNullOrEmpty()) {
-                            Log.i(TAG, "📩 user=$agente.U_LLG_AGENT_PHONE")
-                            // No es un agente FISE, se asume que es un chofer enviando un cupón
-                            procesarMensajeChofer(context, from, body)
+                        if (!agentes.isNullOrEmpty()) {
+                            val agente = agentes.first()
+                            if (!agente.U_LLG_DEALER_PHONE.isNullOrEmpty()) {
+                                Log.i(TAG, "📩 dealer=$agente.U_LLG_DEALER_PHONE")
+                                // Es un agente FISE, procesamos el mensaje de respuesta de la entidad
+                                procesarMensajeFise(context, from, body)
+                            } else if (!agente.U_LLG_AGENT_PHONE.isNullOrEmpty()) {
+                                Log.i(TAG, "📩 user=$agente.U_LLG_AGENT_PHONE")
+                                // No es un agente FISE, se asume que es un chofer enviando un cupón
+                                procesarMensajeChofer(context, from, body)
+                            }
                         }
-                    }
+                }
+
                 }
             } finally {
                 pendingResult.finish()
             }
         }
     }
+
+    private suspend fun procesarMensajeValidacion(body: String): MsjValidacion{
+
+        try {
+            // for procesarMensajeFise2
+            val parsedBody = extraerDatosMensaje(body)
+
+            if (parsedBody == null) {
+                Log.e(TAG, "❌ Error al parsear mensaje de FISE: $body")
+                return
+            }
+
+            val code = parsedBody["code"] as? Int ?: -1
+//            validamos procesarMensajeChofer2
+
+            val (cupon, dni) = parseCuponDni(body)
+
+//            if (cupon.isNullOrBlank() || dni.isNullOrBlank()) {
+//                Log.w(TAG, "⚠️ No se pudo parsear CUPON/DNI en body='$body'")
+//                return
+//            }
+
+//            return MensajeChofer(cupon,dni)
+            MsjValidacion(cupon,dni,code)
+        }catch {
+             MsjValidacion(null,null,-1)
+        }
+
+    }
+
+
 
     private suspend fun procesarMensajeFise(
         context: Context,
@@ -102,7 +141,7 @@ class SmsReceiver : BroadcastReceiver() {
         Log.i(TAG, "📨 Procesando mensaje de FISE")
 
         try {
-            //            VALIDAMOS QUE TIPO DE STRING ES Y REVISAMOS
+            // VALIDAMOS QUE TIPO DE STRING ES Y REVISAMOS
             val parsedBody = extraerDatosMensaje(body)
 
             if (parsedBody == null) {
@@ -125,8 +164,10 @@ class SmsReceiver : BroadcastReceiver() {
             Log.e(TAG, "❌ Error procesando mensaje FISE", e)
         }
     }
-
     //    RESPUESTA FINAL PARA EL CHOFER O DISTRIBUIDOR
+
+
+
     private suspend fun procesarMensajeChofer(
         context: Context,
         from: String,
@@ -181,6 +222,7 @@ class SmsReceiver : BroadcastReceiver() {
         )
         transactionDao.insertOrUpdate(transaction)
     }
+
     private suspend fun procesarMensajeValido(
         context: Context,
         from: String,
@@ -330,8 +372,8 @@ private fun procesarMensajeErrado(  parsedBody: Map<String, Any>) {
         val cuponRegex = Regex("""(?i)CUPON[: ]+(\d{6,20})""")
         val dniRegex = Regex("""(?i)DNI[: ]+(\d{8})""")
 
-        val cupon = cuponRegex.find(body)?.groupValues?.get(1)
-        val dni = dniRegex.find(body)?.groupValues?.get(1)
+        val cupon = cuponRegex.find(body)?.groupValues?.get(1) ?: ""
+        val dni = dniRegex.find(body)?.groupValues?.get(1) ?: ""
 
         return cupon to dni
     }
