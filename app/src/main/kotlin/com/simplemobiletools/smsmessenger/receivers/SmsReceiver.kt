@@ -102,33 +102,28 @@ class SmsReceiver : BroadcastReceiver() {
         }
     }
 
-    private suspend fun procesarMensajeValidacion(body: String): MsjValidacion{
-
-        try {
-            // for procesarMensajeFise2
+    private suspend fun procesarMensajeValidacion(body: String): MsjValidacion {
+        return try {
             val parsedBody = extraerDatosMensaje(body)
-
             if (parsedBody == null) {
                 Log.e(TAG, "❌ Error al parsear mensaje de FISE: $body")
-                return
+                return MsjValidacion("", "", -1)
             }
 
-            val code = parsedBody["code"] as? Int ?: -1
-//            validamos procesarMensajeChofer2
+            // code puede venir como Int, String o Number
+            val code = when (val raw = parsedBody["code"]) {
+                is Int -> raw
+                is String -> raw.trim().toIntOrNull() ?: -1
+                is Number -> raw.toInt()
+                else -> -1
+            }
 
             val (cupon, dni) = parseCuponDni(body)
-
-//            if (cupon.isNullOrBlank() || dni.isNullOrBlank()) {
-//                Log.w(TAG, "⚠️ No se pudo parsear CUPON/DNI en body='$body'")
-//                return
-//            }
-
-//            return MensajeChofer(cupon,dni)
-            MsjValidacion(cupon,dni,code)
-        }catch {
-             MsjValidacion(null,null,-1)
+            MsjValidacion(cupon.orEmpty(), dni.orEmpty(), code)
+        } catch (e: Exception) {
+            Log.e(TAG, "Error en procesarMensajeValidacion", e)
+            MsjValidacion("", "", -1)
         }
-
     }
 
 
