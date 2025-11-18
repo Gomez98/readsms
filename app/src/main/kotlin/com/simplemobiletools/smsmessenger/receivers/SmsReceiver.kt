@@ -5,13 +5,11 @@ import android.content.BroadcastReceiver
 import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
-import android.net.Uri
 import android.os.Build
 import android.provider.Telephony
 import android.telephony.SmsManager
 import android.util.Log
 import com.google.gson.Gson
-import com.simplemobiletools.smsmessenger.BuildConfig
 import com.simplemobiletools.smsmessenger.databases.MessagesDatabase
 import com.simplemobiletools.smsmessenger.extensions.*
 import com.simplemobiletools.smsmessenger.interfaces.TransactionDao
@@ -38,6 +36,9 @@ class SmsReceiver : BroadcastReceiver() {
         private const val PROCESS_TIMEOUT_MS = 30000L
         private const val MAX_CONCURRENT_CALLS = 5
         private const val CACHE_DURATION_MS = 5 * 60 * 1000 // 5 minutos
+
+        // Número FISE (ajústalo si cambia)
+        private const val FISE_NUMBER = "970115159"
     }
 
     private lateinit var transactionDao: TransactionDao
@@ -46,7 +47,6 @@ class SmsReceiver : BroadcastReceiver() {
     private val apiSemaphore = Semaphore(MAX_CONCURRENT_CALLS)
     private val processedMessages = ConcurrentHashMap<String, Long>()
 
-    // Modelo de validación
     data class MsjValidacion(
         val cupon: String,
         val dni: String,
@@ -58,20 +58,17 @@ class SmsReceiver : BroadcastReceiver() {
         val startTime = System.currentTimeMillis()
 
         try {
-            // Validar acción
             if (Telephony.Sms.Intents.SMS_DELIVER_ACTION != intent.action) {
                 Log.w(TAG, "Acción no es SMS_DELIVER: ${intent.action}")
                 return
             }
 
-            // Validar contexto
             val appContext = context.applicationContext
             if (appContext !is Application) {
                 Log.e(TAG, "Contexto inválido: no es Application")
                 return
             }
 
-            // Inicializar componentes
             transactionDao = MessagesDatabase.getInstance(context).TransactionDao()
 
             val pendingResult = goAsync()
@@ -106,52 +103,69 @@ class SmsReceiver : BroadcastReceiver() {
         }
     }
 
-    private suspend fun processMessages(context: Context, msgs: Array<android.telephony.SmsMessage>) {
-        msgs.forEachIndexed { index, msg ->
-            try {
-                Log.d(TAG, "Procesando mensaje ${index + 1}/${msgs.size}")
-                processSingleMessage(context, msg)
-            } catch (e: Exception) {
-                Log.e(TAG, "Error procesando mensaje individual $index", e)
-                // Continuar con el siguiente mensaje
-            }
+    // 🔴 AQUÍ RECONSTRUIMOS EL SMS COMPLETO (multi-parte)
+    private suspend fun processMessages(
+        context: Context,
+        msgs: Array<android.telephony.SmsMessage>
+    ) {
+        if (msgs.isEmpty()) return
+
+        val first = msgs[0]
+        val from = first.displayOriginatingAddress ?: first.originatingAddress ?: run {
+            Log.w(TAG, "Remitente no disponible (multi-part)")
+            return
         }
+
+        val fullBody = msgs.joinToString(separator = "") { part ->
+            part.displayMessageBody ?: part.messageBody ?: ""
+        }
+
+        val timestamp = first.timestampMillis
+
+        Log.d(
+            TAG,
+            "📦 Mensaje reconstruido (${msgs.size} partes) desde $from: ${fullBody.take(80)}..."
+        )
+
+        processSingleMessage(context, from, fullBody, timestamp)
     }
 
-    private suspend fun processSingleMessage(context: Context, msg: android.telephony.SmsMessage) {
+    private fun isFromFise(from: String): Boolean {
+        val clean = from.replace("+51", "").replace(" ", "")
+        return clean == FISE_NUMBER
+    }
+
+    private suspend fun processSingleMessage(
+        context: Context,
+        from: String,
+        body: String,
+        timestamp: Long
+    ) {
         val messageStartTime = System.currentTimeMillis()
 
         try {
-            // Extraer datos del mensaje
-            val from = msg.displayOriginatingAddress ?: msg.originatingAddress ?: run {
-                Log.w(TAG, "Remitente no disponible")
-                return
-            }
+            Log.i(TAG, "📨 De: $from, Mensaje: ${body.take(80)}...")
 
-            val body = msg.displayMessageBody ?: msg.messageBody ?: run {
-                Log.w(TAG, "Cuerpo del mensaje no disponible")
-                return
-            }
-
-            Log.i(TAG, "📨 De: $from, Mensaje: ${body.take(50)}...")
-
-            // Validar longitud del mensaje
             if (body.length > MESSAGE_MAX_LENGTH || body.length < MESSAGE_MIN_LENGTH) {
                 Log.w(TAG, "Mensaje con longitud inválida: ${body.length} caracteres")
                 return
             }
 
-            // Anti-duplicado: verificar si ya procesamos este mensaje
             val cacheKey = generateCacheKey(from, body)
             if (isRecentlyProcessed(cacheKey)) {
                 Log.d(TAG, "Mensaje duplicado ignorado: $from")
                 return
             }
 
-            // Guardar en el provider de telefonía
-            saveToTelephony(context, from, body, msg.timestampMillis)
+            saveIncomingToTelephony(context, from, body, timestamp)
 
-            // Procesar lógica FISE
+            if (isFromFise(from)) {
+                Log.i(TAG, "📨 Mensaje desde FISE, procesando respuesta...")
+                procesarRespuestaFise(context, from, body)
+                markAsProcessed(cacheKey)
+                return
+            }
+
             val result = processFiseLogic(context, from, body)
 
             if (result.isSuccess) {
@@ -177,9 +191,7 @@ class SmsReceiver : BroadcastReceiver() {
     }
 
     private fun isRecentlyProcessed(key: String): Boolean {
-        val timestamp = processedMessages[key]
-        if (timestamp == null) return false
-
+        val timestamp = processedMessages[key] ?: return false
         val isRecent = System.currentTimeMillis() - timestamp < CACHE_DURATION_MS
         if (!isRecent) {
             processedMessages.remove(key)
@@ -191,7 +203,13 @@ class SmsReceiver : BroadcastReceiver() {
         processedMessages[key] = System.currentTimeMillis()
     }
 
-    private fun saveToTelephony(context: Context, from: String, body: String, timestamp: Long) {
+    // 💾 ENTRANTE → INBOX
+    private fun saveIncomingToTelephony(
+        context: Context,
+        from: String,
+        body: String,
+        timestamp: Long
+    ) {
         try {
             val values = ContentValues().apply {
                 put(Telephony.Sms.Inbox.ADDRESS, from)
@@ -201,21 +219,53 @@ class SmsReceiver : BroadcastReceiver() {
             }
 
             context.contentResolver.insert(Telephony.Sms.Inbox.CONTENT_URI, values)
-            Log.d(TAG, "💾 Mensaje guardado en telefonía")
+            Log.d(TAG, "💾 Mensaje ENTRANTE guardado en telefonía (INBOX)")
 
-            // Notificar a la UI
             org.greenrobot.eventbus.EventBus.getDefault().post(Events.RefreshMessages())
 
         } catch (e: Exception) {
-            Log.e(TAG, "❌ Error guardando en telefonía", e)
+            Log.e(TAG, "❌ Error guardando entrante en telefonía", e)
         }
     }
 
-    private suspend fun processFiseLogic(context: Context, from: String, body: String): Result<Unit> {
+    // 💾 SALIENTE → SENT
+    private fun saveOutgoingToTelephony(
+        context: Context,
+        to: String,
+        body: String,
+        timestamp: Long = System.currentTimeMillis()
+    ) {
+        try {
+            if (to.isBlank()) {
+                Log.w(TAG, "⚠️ No se guarda SMS saliente: número vacío")
+                return
+            }
+
+            val values = ContentValues().apply {
+                put(Telephony.Sms.ADDRESS, to)
+                put(Telephony.Sms.BODY, body)
+                put(Telephony.Sms.DATE, timestamp)
+                put(Telephony.Sms.TYPE, Telephony.Sms.MESSAGE_TYPE_SENT)
+                put(Telephony.Sms.READ, 1)
+            }
+
+            context.contentResolver.insert(Telephony.Sms.Sent.CONTENT_URI, values)
+            Log.d(TAG, "💾 Mensaje SALIENTE guardado en telefonía (SENT) → $to")
+
+            org.greenrobot.eventbus.EventBus.getDefault().post(Events.RefreshMessages())
+        } catch (e: Exception) {
+            Log.e(TAG, "❌ Error guardando saliente en telefonía", e)
+        }
+    }
+
+    private suspend fun processFiseLogic(
+        context: Context,
+        from: String,
+        body: String
+    ): Result<Unit> {
         return try {
             Log.d(TAG, "🔍 Procesando lógica FISE")
 
-            // Parsear datos del mensaje
             val (cupon, dni, sn) = parseCuponDni(body)
 
             if (cupon.isBlank() || dni.isBlank()) {
@@ -225,7 +275,6 @@ class SmsReceiver : BroadcastReceiver() {
 
             Log.i(TAG, "📋 Datos parseados - Cupón: $cupon, DNI: $dni, SN: ${sn ?: "N/A"}")
 
-            // Buscar dealer asociado
             val dealerInfo = safeApiCall("agentParent") {
                 getParentDealer(from)
             }.getOrNull()
@@ -243,7 +292,6 @@ class SmsReceiver : BroadcastReceiver() {
 
             Log.i(TAG, "🏢 Dealer encontrado: $phoneDealer")
 
-            // Enviar a FISE
             val replyText = "FISE AH02 $dni $cupon"
             return sendToFiseWithRetry(context, phoneDealer, replyText, from, cupon, dni, sn)
 
@@ -258,7 +306,6 @@ class SmsReceiver : BroadcastReceiver() {
         block: suspend () -> T
     ): Result<T> = withContext(Dispatchers.IO) {
         try {
-            // Usamos Semaphore de java.util.concurrent para limitar concurrencia
             apiSemaphore.acquire()
             try {
                 withTimeout(8000) {
@@ -282,9 +329,7 @@ class SmsReceiver : BroadcastReceiver() {
         }
     }
 
-    /**
-     * Enviar SMS REAL usando SmsManager, sin pasar por SmsSender.
-     */
+    // Enviar SMS real
     private fun sendSms(context: Context, to: String, text: String) {
         try {
             if (to.isBlank()) {
@@ -317,15 +362,13 @@ class SmsReceiver : BroadcastReceiver() {
         return try {
             Log.i(TAG, "📤 Enviando a FISE: $replyText → $phoneDealer")
 
-            // Enviar SMS al dealer con SmsManager
             sendSms(context, phoneDealer, replyText)
+            saveOutgoingToTelephony(context, phoneDealer, replyText)
 
-            // Guardar transacción
             val transaction = Transaction(
                 driverPhone = from,
                 entidad = phoneDealer,
                 agentePhone = from,
-                // sn se omite en el modelo si no existe en la data class Transaction
                 cupon = cupon,
                 dni = dni,
                 fecha = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.getDefault()).format(Date()),
@@ -346,7 +389,6 @@ class SmsReceiver : BroadcastReceiver() {
 
     private fun saveTransaction(transaction: Transaction) {
         try {
-            // Validar datos antes de guardar
             if (transaction.cupon.isBlank() || transaction.dni.isBlank()) {
                 Log.w(TAG, "⚠️ Datos inválidos para transacción")
                 return
@@ -360,7 +402,6 @@ class SmsReceiver : BroadcastReceiver() {
         }
     }
 
-    // Parser mejorado con validaciones
     private fun parseCuponDni(body: String): Triple<String, String, String?> {
         return try {
             val cuponRegex = Regex("""(?i)CUPON[:\s]+(\d{6,20})""")
@@ -380,7 +421,6 @@ class SmsReceiver : BroadcastReceiver() {
         }
     }
 
-    // Funciones API mejoradas
     private suspend fun getParentDealer(phone: String): Agente? {
         val nro = phone.replace("+51", "")
         Log.d(TAG, "🔍 Buscando dealer para: $nro")
@@ -433,7 +473,7 @@ class SmsReceiver : BroadcastReceiver() {
         }
     }
 
-    // Función para procesar respuestas de FISE (cuando recibes la validación)
+    // 🔁 Respuesta FISE
     suspend fun procesarRespuestaFise(context: Context, from: String, body: String) {
         try {
             Log.i(TAG, "📨 Procesando respuesta FISE de: $from")
@@ -469,7 +509,6 @@ class SmsReceiver : BroadcastReceiver() {
 
             Log.i(TAG, "✅ Cupón válido: $cupon, Importe: $importe")
 
-            // Buscar transacción pendiente
             val transaction = transactionDao.getTxByCuponAndDni(cupon, dni)
             if (transaction == null) {
                 Log.w(TAG, "⚠️ No se encontró transacción PENDING para: $cupon / $dni")
@@ -482,7 +521,6 @@ class SmsReceiver : BroadcastReceiver() {
                 return
             }
 
-            // Actualizar transacción
             transactionDao.updateTransaction(
                 cupon = cupon,
                 dni = dni,
@@ -491,7 +529,6 @@ class SmsReceiver : BroadcastReceiver() {
                 respuesta = descripcion
             )
 
-            // Enviar respuesta al chofer
             val textoChofer = if (importe != null) {
                 "Cupón $cupon validado. Importe por S/ $importe"
             } else {
@@ -500,6 +537,7 @@ class SmsReceiver : BroadcastReceiver() {
 
             Log.i(TAG, "📤 Enviando a chofer $driverPhone: $textoChofer")
             sendSms(context, driverPhone, textoChofer)
+            saveOutgoingToTelephony(context, driverPhone, textoChofer)
 
         } catch (e: Exception) {
             Log.e(TAG, "❌ Error procesando mensaje válido", e)
@@ -510,9 +548,7 @@ class SmsReceiver : BroadcastReceiver() {
         try {
             val rawMessage = parsedBody["raw"] as? String ?: ""
             Log.w(TAG, "⚠️ Mensaje ERRADO de FISE: $rawMessage")
-
-            // TODO: Implementar notificación al chofer de cupón errado
-
+            // Aquí luego puedes notificar al chofer si quieres
         } catch (e: Exception) {
             Log.e(TAG, "❌ Error procesando mensaje errado", e)
         }
@@ -529,7 +565,6 @@ class SmsReceiver : BroadcastReceiver() {
 
             Log.i(TAG, "📋 Cupón ya procesado: $cupon (Fecha: $fecha, Hora: $hora)")
 
-            // Buscar transacción
             val transaction = transactionDao.getTxByCuponOnly(cupon)
             if (transaction == null) {
                 Log.w(TAG, "⚠️ No se encontró transacción para cupón procesado: $cupon")
@@ -542,27 +577,28 @@ class SmsReceiver : BroadcastReceiver() {
                 return
             }
 
-            // Notificar al chofer
             val textoChofer = "Cupón $cupon ya fue validado anteriormente"
             Log.i(TAG, "📤 Enviando a chofer $driverPhone: $textoChofer")
             sendSms(context, driverPhone, textoChofer)
+            saveOutgoingToTelephony(context, driverPhone, textoChofer)
 
         } catch (e: Exception) {
             Log.e(TAG, "❌ Error procesando mensaje procesado", e)
         }
     }
 
-    // Parser mejorado de mensajes FISE
+    // Parser respuesta FISE (mensaje completo)
     private fun extraerDatosMensaje(body: String): Map<String, Any>? {
         return try {
-            // Limitar tamaño para evitar OOM
             if (body.length > 500) {
                 Log.w(TAG, "Mensaje FISE demasiado largo: ${body.length} caracteres")
                 return null
             }
 
-            // Caso ERRADO
-            if (Regex("""\bERRADO\b""", RegexOption.IGNORE_CASE).containsMatchIn(body)) {
+            val upper = body.uppercase(Locale.getDefault())
+
+            // ERRADO
+            if (upper.contains("ERRADO")) {
                 return mapOf(
                     "code" to 10,
                     "mensaje" to "Vale ERRADO",
@@ -570,10 +606,11 @@ class SmsReceiver : BroadcastReceiver() {
                 )
             }
 
-            // Caso VALE PROCESADO
-            if (Regex("""\bVALE PROCESADO\b""", RegexOption.IGNORE_CASE).containsMatchIn(body)) {
+            // VALE PROCESADO (ya usado)
+            if (upper.contains("VALE PROCESADO")) {
                 val cupon = body.trim().substringAfterLast(' ')
-                val fechaHoraRegex = Regex("""\b(\d{2}/\d{2}/\d{4})\s+([01]?\d|2[0-3]):[0-5]\d\b""")
+                val fechaHoraRegex =
+                    Regex("""\b(\d{2}/\d{2}/\d{4})\s+([01]?\d|2[0-3]):[0-5]\d\b""")
                 val match = fechaHoraRegex.find(body)
                 val fecha = match?.groupValues?.get(1)
                 val hora = match?.groupValues?.get(2)
@@ -588,18 +625,30 @@ class SmsReceiver : BroadcastReceiver() {
                 )
             }
 
-            // Caso válido con Cupon/DNI/Importe
-            val descripcion = body.lines().firstOrNull()?.trim() ?: ""
-            val dni = Regex("""DNI:\s*(\d{8})""").find(body)?.groupValues?.get(1)
-            val cupon = Regex("""CUPON:\s*(\d{10,13})""", RegexOption.IGNORE_CASE)
-                .find(body)?.groupValues?.get(1)
+            // ✅ Caso válido: como el ejemplo de FISE
+            // El cupon se proceso correctamente.
+            // DNI: 74944387
+            // CUPON: 12345678999
+            // IMPORTE: S/. 60
 
-            val importeRaw = Regex(
-                """IMPORTE[:=]?\s*(?:S\s*/\s*\.)?\s*([0-9]{1,3}(?:[.,]\d{3})*(?:[.,]\d{1,2})|[0-9]+)""",
+            val descripcion = body.lines().firstOrNull()?.trim() ?: ""
+
+            val dni = Regex(
+                """DNI[:\s]+(\d{8})""",
                 RegexOption.IGNORE_CASE
             ).find(body)?.groupValues?.get(1)
 
-            val importe = importeRaw?.let { normNumber(it) } ?: 0.0
+            val cupon = Regex(
+                """CUPON[:\s]*([0-9]{6,20})""",
+                RegexOption.IGNORE_CASE
+            ).find(body)?.groupValues?.get(1)
+
+            val importeRaw = Regex(
+                """IMPORTE[:=]?\s*(?:S\s*/\s*\.?)?\s*([0-9]{1,3}(?:[.,]\d{3})*(?:[.,]\d{1,2})|[0-9]+)""",
+                RegexOption.IGNORE_CASE
+            ).find(body)?.groupValues?.get(1)
+
+            val importe = importeRaw?.let { normNumber(it) }
 
             if (dni != null && cupon != null) {
                 return mapOf(
@@ -607,13 +656,12 @@ class SmsReceiver : BroadcastReceiver() {
                     "descripcion" to descripcion,
                     "dni" to dni,
                     "cupon" to cupon,
-                    "importe" to importe,
+                    "importe" to (importe ?: 0.0),
                     "raw" to body,
                     "mensaje" to "Generacion FISE"
                 )
             }
 
-            // Ningún caso reconocido
             mapOf(
                 "code" to -1,
                 "mensaje" to "No se pudo interpretar",
@@ -626,7 +674,6 @@ class SmsReceiver : BroadcastReceiver() {
         }
     }
 
-    // Normalización de números
     private fun normNumber(s: String): Double {
         return try {
             val lastDot = s.lastIndexOf('.')
