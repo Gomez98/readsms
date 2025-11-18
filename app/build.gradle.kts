@@ -97,7 +97,12 @@ android {
 }
 
 dependencies {
-    implementation(libs.simple.mobile.tools.commons)
+    // Reemplaza la dependencia rota por una que funcione
+    implementation(libs.simple.mobile.tools.commons) {
+        exclude(group = "com.github.duolingo", module = "rtl-viewpager")
+    }
+    implementation("com.github.duolingo:rtl-viewpager:2.0.0")  // ← GroupId correcto para JitPack
+
     implementation(libs.eventbus)
     implementation(libs.indicator.fast.scroll)
     implementation(libs.android.smsmms)
@@ -108,5 +113,6 @@ dependencies {
     implementation(libs.ez.vcard)
     implementation(libs.kotlinx.serialization.json)
     implementation(libs.bundles.room)
+    implementation(libs.play.services.vision.common)
     ksp(libs.androidx.room.compiler)
 }

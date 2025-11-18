@@ -1,0 +1,2 @@
+"C:\Users\JorgeTerrones\AppData\Local\Android\Sdk\platform-tools\adb.exe" devices
+
