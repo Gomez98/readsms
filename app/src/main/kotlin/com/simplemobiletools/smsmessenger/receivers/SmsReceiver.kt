@@ -16,9 +16,9 @@ import com.simplemobiletools.smsmessenger.interfaces.TransactionDao
 import com.simplemobiletools.smsmessenger.models.*
 import kotlinx.coroutines.*
 import java.io.IOException
+import java.net.HttpURLConnection
 import java.net.SocketTimeoutException
 import java.net.URL
-import java.net.HttpURLConnection
 import java.text.SimpleDateFormat
 import java.util.*
 import java.util.concurrent.ConcurrentHashMap
@@ -36,9 +36,6 @@ class SmsReceiver : BroadcastReceiver() {
         private const val PROCESS_TIMEOUT_MS = 30000L
         private const val MAX_CONCURRENT_CALLS = 5
         private const val CACHE_DURATION_MS = 5 * 60 * 1000 // 5 minutos
-
-        // Número FISE (ajústalo si cambia)
-        private const val FISE_NUMBER = "970115159"
     }
 
     private lateinit var transactionDao: TransactionDao
@@ -103,7 +100,7 @@ class SmsReceiver : BroadcastReceiver() {
         }
     }
 
-    // 🔴 AQUÍ RECONSTRUIMOS EL SMS COMPLETO (multi-parte)
+    // 🔴 Reconstruimos el SMS completo (multi-parte)
     private suspend fun processMessages(
         context: Context,
         msgs: Array<android.telephony.SmsMessage>
@@ -130,9 +127,18 @@ class SmsReceiver : BroadcastReceiver() {
         processSingleMessage(context, from, fullBody, timestamp)
     }
 
-    private fun isFromFise(from: String): Boolean {
-        val clean = from.replace("+51", "").replace(" ", "")
-        return clean == FISE_NUMBER
+    // Detectar si el mensaje "parece" respuesta FISE por contenido
+    private fun looksLikeFiseResponse(body: String): Boolean {
+        val upper = body.uppercase(Locale.getDefault())
+
+        // patrones claros de RESPUESTA FISE (no del chofer)
+        if (upper.contains("ERRADO")) return true
+        if (upper.contains("VALE PROCESADO")) return true
+        if (upper.contains("EL CUPON SE PROCESO CORRECTAMENTE")) return true
+        if (upper.contains("IMPORTE:")) return true
+
+        // OJO: NO usamos "DNI:" && "CUPON:" porque el chofer también lo manda así
+        return false
     }
 
     private suspend fun processSingleMessage(
@@ -157,15 +163,18 @@ class SmsReceiver : BroadcastReceiver() {
                 return
             }
 
+            // Guardamos SIEMPRE en la bandeja de entrada
             saveIncomingToTelephony(context, from, body, timestamp)
 
-            if (isFromFise(from)) {
-                Log.i(TAG, "📨 Mensaje desde FISE, procesando respuesta...")
+            // Si el contenido parece respuesta FISE → procesar como respuesta
+            if (looksLikeFiseResponse(body)) {
+                Log.i(TAG, "📨 Mensaje con formato FISE, procesando respuesta...")
                 procesarRespuestaFise(context, from, body)
                 markAsProcessed(cacheKey)
                 return
             }
 
+            // Si no es respuesta FISE → se asume mensaje de chofer / celular autorizado
             val result = processFiseLogic(context, from, body)
 
             if (result.isSuccess) {
@@ -258,6 +267,10 @@ class SmsReceiver : BroadcastReceiver() {
         }
     }
 
+    /**
+     * Lógica cuando el mensaje es de chofer / celular autorizado.
+     * Aquí se obtiene dinámicamente el número FISE/entidad desde la API.
+     */
     private suspend fun processFiseLogic(
         context: Context,
         from: String,
@@ -285,15 +298,26 @@ class SmsReceiver : BroadcastReceiver() {
             }
 
             val phoneDealer = dealerInfo.U_LLG_DEALER_PHONE
+            val agentPhone = dealerInfo.U_LLG_AGENT_PHONE  // si tu modelo lo tiene
+
             if (phoneDealer.isNullOrBlank()) {
                 Log.w(TAG, "⚠️ Dealer sin teléfono asignado")
                 return Result.failure(Exception("Dealer sin teléfono"))
             }
 
-            Log.i(TAG, "🏢 Dealer encontrado: $phoneDealer")
+            Log.i(TAG, "🏢 Dealer encontrado (FISE/Entidad): $phoneDealer")
 
             val replyText = "FISE AH02 $dni $cupon"
-            return sendToFiseWithRetry(context, phoneDealer, replyText, from, cupon, dni, sn)
+            return sendToFiseWithRetry(
+                context = context,
+                phoneDealer = phoneDealer,
+                replyText = replyText,
+                from = from,
+                cupon = cupon,
+                dni = dni,
+                sn = sn,
+                agentePhone = agentPhone
+            )
 
         } catch (e: Exception) {
             Log.e(TAG, "❌ Error en lógica FISE", e)
@@ -350,6 +374,10 @@ class SmsReceiver : BroadcastReceiver() {
         }
     }
 
+    /**
+     * Aquí se envía el SMS a FISE/Entidad y se inserta la transacción en SQLite
+     * como PENDING, igual al enfoque de tu amigo.
+     */
     private suspend fun sendToFiseWithRetry(
         context: Context,
         phoneDealer: String,
@@ -357,7 +385,8 @@ class SmsReceiver : BroadcastReceiver() {
         from: String,
         cupon: String,
         dni: String,
-        sn: String?
+        sn: String?,
+        agentePhone: String?
     ): Result<Unit> {
         return try {
             Log.i(TAG, "📤 Enviando a FISE: $replyText → $phoneDealer")
@@ -366,12 +395,15 @@ class SmsReceiver : BroadcastReceiver() {
             saveOutgoingToTelephony(context, phoneDealer, replyText)
 
             val transaction = Transaction(
-                driverPhone = from,
-                entidad = phoneDealer,
-                agentePhone = from,
+                driverPhone = from,                    // chofer/celular que envió el cupón
+                entidad = phoneDealer,                 // número FISE/Entidad
+                agentePhone = agentePhone ?: from,     // agente autorizado; si no viene, usamos from
                 cupon = cupon,
                 dni = dni,
-                fecha = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.getDefault()).format(Date()),
+                fecha = SimpleDateFormat(
+                    "yyyy-MM-dd HH:mm:ss",
+                    Locale.getDefault()
+                ).format(Date()),
                 monto = null,
                 estado = TxStatus.PENDING.toString(),
                 respuesta = null
@@ -396,6 +428,11 @@ class SmsReceiver : BroadcastReceiver() {
 
             transactionDao.insertOrUpdate(transaction)
             Log.d(TAG, "💾 Transacción guardada: ${transaction.cupon}")
+
+            // 👇 Debug extra: ver qué hay en la tabla 'transactions'
+            scope.launch {
+                debugPrintLastTransactions()
+            }
 
         } catch (e: Exception) {
             Log.e(TAG, "❌ Error guardando transacción", e)
@@ -473,7 +510,7 @@ class SmsReceiver : BroadcastReceiver() {
         }
     }
 
-    // 🔁 Respuesta FISE
+    // 🔁 Respuesta FISE (mensaje de la entidad/FISE)
     suspend fun procesarRespuestaFise(context: Context, from: String, body: String) {
         try {
             Log.i(TAG, "📨 Procesando respuesta FISE de: $from")
@@ -509,9 +546,24 @@ class SmsReceiver : BroadcastReceiver() {
 
             Log.i(TAG, "✅ Cupón válido: $cupon, Importe: $importe")
 
-            val transaction = transactionDao.getTxByCuponAndDni(cupon, dni)
+            // 1) Intentamos buscar por CUPÓN + DNI (lo ideal)
+            var transaction = transactionDao.getTxByCuponAndDni(cupon, dni)
+
+            // 2) Si no se encuentra, hacemos fallback a buscar solo por CUPÓN
             if (transaction == null) {
-                Log.w(TAG, "⚠️ No se encontró transacción PENDING para: $cupon / $dni")
+                Log.w(
+                    TAG,
+                    "⚠️ No se encontró transacción por cupón+DNI. Intentando solo por cupón: $cupon"
+                )
+                transaction = transactionDao.getTxByCuponOnly(cupon)
+            }
+
+            // 3) Si sigue sin encontrarse, ya no podemos hacer nada
+            if (transaction == null) {
+                Log.w(
+                    TAG,
+                    "⚠️ No se encontró transacción asociada para: $cupon / $dni (ni por cupón ni por cupón+DNI)"
+                )
                 return
             }
 
@@ -521,6 +573,7 @@ class SmsReceiver : BroadcastReceiver() {
                 return
             }
 
+            // 4) Actualizamos la transacción a DELIVERED
             transactionDao.updateTransaction(
                 cupon = cupon,
                 dni = dni,
@@ -529,6 +582,7 @@ class SmsReceiver : BroadcastReceiver() {
                 respuesta = descripcion
             )
 
+            // 5) Armamos el SMS para el chofer
             val textoChofer = if (importe != null) {
                 "Cupón $cupon validado. Importe por S/ $importe"
             } else {
@@ -625,12 +679,11 @@ class SmsReceiver : BroadcastReceiver() {
                 )
             }
 
-            // ✅ Caso válido: como el ejemplo de FISE
+            // Caso válido típico FISE:
             // El cupon se proceso correctamente.
             // DNI: 74944387
             // CUPON: 12345678999
             // IMPORTE: S/. 60
-
             val descripcion = body.lines().firstOrNull()?.trim() ?: ""
 
             val dni = Regex(
@@ -698,6 +751,30 @@ class SmsReceiver : BroadcastReceiver() {
         } catch (e: Exception) {
             Log.e(TAG, "❌ Error normalizando número: $s", e)
             0.0
+        }
+    }
+
+    // 👇 NUEVO: debug para ver lo que hay en la tabla 'transactions'
+    private fun debugPrintLastTransactions() {
+        try {
+            val list = transactionDao.debugGetLastTransactions()
+
+            Log.d(TAG, "================ TRANSACCIONES EN BD ================")
+            if (list.isEmpty()) {
+                Log.d(TAG, "📭 No hay transacciones en la tabla 'transactions'")
+            } else {
+                list.forEach { tx ->
+                    Log.d(
+                        TAG,
+                        "TX -> cupon=${tx.cupon}, dni=${tx.dni}, estado=${tx.estado}, " +
+                            "driver=${tx.driverPhone}, entidad=${tx.entidad}, fecha=${tx.fecha}, monto=${tx.monto}"
+                    )
+                }
+            }
+            Log.d(TAG, "=====================================================")
+
+        } catch (e: Exception) {
+            Log.e(TAG, "❌ Error en debugPrintLastTransactions", e)
         }
     }
 }
