@@ -294,8 +294,15 @@ class SmsReceiver : BroadcastReceiver() {
 
             if (dealerInfo == null) {
                 Log.w(TAG, "⚠️ No se encontró dealer para: $from")
+
+                // NUEVO: avisar al chofer que hubo problema de red
+                val textoError = "No se pudo procesar el cupón por un problema de conexión. Inténtalo nuevamente."
+                sendSms(context, from, textoError)
+                saveOutgoingToTelephony(context, from, textoError)
+
                 return Result.failure(Exception("Dealer no encontrado"))
             }
+
 
             val phoneDealer = dealerInfo.U_LLG_DEALER_PHONE
             val agentPhone = dealerInfo.U_LLG_AGENT_PHONE  // si tu modelo lo tiene
