@@ -747,14 +747,36 @@ class SmsReceiver : BroadcastReceiver() {
                 )
             }
 
-            // VALE PROCESADO
+            // ✅ VALE PROCESADO (ya usado / cupón procesado)
             if (upper.contains("VALE PROCESADO")) {
-                val cupon = body.trim().substringAfterLast(' ')
-                val fechaHoraRegex =
-                    Regex("""\b(\d{2}/\d{2}/\d{4})\s+([01]?\d|2[0-3]):[0-5]\d\b""")
+                val lines = body.lines()
+                    .map { it.trim() }
+                    .filter { it.isNotEmpty() }
+
+                // Buscar la última línea que sea solo números y con longitud razonable (6-20)
+                val cupon = lines.lastOrNull { line ->
+                    line.all { ch -> ch.isDigit() } && line.length in 6..20
+                } ?: run {
+                    // Fallback: último grupo de 6–20 dígitos en todo el cuerpo
+                    Regex("""(\d{6,20})""")
+                        .findAll(body)
+                        .lastOrNull()
+                        ?.groupValues
+                        ?.get(1)
+                        ?: ""
+                }
+
+                // Soportar:
+                // - 2025/10/10 15:31:43
+                // - 10/10/2025 15:31
+                val fechaHoraRegex = Regex(
+                    """(\d{4}/\d{2}/\d{2}|\d{2}/\d{2}/\d{4})\s+([0-2]\d:[0-5]\d(?::[0-5]\d)?)"""
+                )
                 val match = fechaHoraRegex.find(body)
                 val fecha = match?.groupValues?.get(1)
                 val hora = match?.groupValues?.get(2)
+
+                Log.d(TAG, "🔍 VALE PROCESADO parseado - Cupón: $cupon, Fecha: $fecha, Hora: $hora")
 
                 return mapOf(
                     "code" to 20,
