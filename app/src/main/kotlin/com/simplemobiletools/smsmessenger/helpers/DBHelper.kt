@@ -11,3 +11,4 @@ const val TX_FECHA = "fecha"
 const val TX_MONTO = "monto"
 const val TX_ESTADO = "estado"              // PENDING|SUCCESS|ERROR|USED
 const val TX_RESPUESTA = "respuesta"
+const val TX_SN = "sn"

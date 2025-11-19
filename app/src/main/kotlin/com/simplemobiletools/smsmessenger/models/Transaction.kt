@@ -36,5 +36,8 @@ data class Transaction(
     var estado: String?,
 
     @ColumnInfo(name = TX_RESPUESTA)
-    var respuesta: String?
+    var respuesta: String?,
+
+    @ColumnInfo(name = TX_SN)
+    var sn: String? = null
 )

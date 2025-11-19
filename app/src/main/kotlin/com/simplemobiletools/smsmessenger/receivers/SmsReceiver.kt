@@ -376,7 +376,7 @@ class SmsReceiver : BroadcastReceiver() {
 
     /**
      * Aquí se envía el SMS a FISE/Entidad y se inserta la transacción en SQLite
-     * como PENDING, igual al enfoque de tu amigo.
+     * como PENDING, ahora **incluyendo SN**.
      */
     private suspend fun sendToFiseWithRetry(
         context: Context,
@@ -406,7 +406,8 @@ class SmsReceiver : BroadcastReceiver() {
                 ).format(Date()),
                 monto = null,
                 estado = TxStatus.PENDING.toString(),
-                respuesta = null
+                respuesta = null,
+                sn = sn                                 // 👈 guardamos el SN en la transacción
             )
 
             saveTransaction(transaction)
@@ -439,24 +440,27 @@ class SmsReceiver : BroadcastReceiver() {
         }
     }
 
-    private fun parseCuponDni(body: String): Triple<String, String, String?> {
-        return try {
-            val cuponRegex = Regex("""(?i)CUPON[:\s]+(\d{6,20})""")
-            val dniRegex = Regex("""(?i)DNI[:\s]+(\d{8})""")
-            val snRegex = Regex("""(?i)\bS/?N[:\s]+(C\d{8})\b""")
+private fun parseCuponDni(body: String): Triple<String, String, String?> {
+    return try {
+        val cuponRegex = Regex("""(?i)CUPON[:\s]+(\d{6,20})""")
+        val dniRegex   = Regex("""(?i)DNI[:\s]+(\d{8})""")
+        // Antes: (C\d{8})
+        // Ahora permitimos C + 8 a 20 dígitos
+        val snRegex    = Regex("""(?i)\bS/?N[:\s]+(C\d{8,20})\b""")
 
-            val cupon = cuponRegex.find(body)?.groupValues?.get(1) ?: ""
-            val dni = dniRegex.find(body)?.groupValues?.get(1) ?: ""
-            val sn = snRegex.find(body)?.groupValues?.get(1)
+        val cupon = cuponRegex.find(body)?.groupValues?.get(1) ?: ""
+        val dni   = dniRegex.find(body)?.groupValues?.get(1) ?: ""
+        val sn    = snRegex.find(body)?.groupValues?.get(1)
 
-            Log.d(TAG, "🔍 Parseo exitoso - Cupón: $cupon, DNI: $dni, SN: $sn")
-            Triple(cupon, dni, sn)
+        Log.d(TAG, "🔍 Parseo exitoso - Cupón: $cupon, DNI: $dni, SN: $sn")
+        Triple(cupon, dni, sn)
 
-        } catch (e: Exception) {
-            Log.e(TAG, "❌ Error parseando mensaje", e)
-            Triple("", "", null)
-        }
+    } catch (e: Exception) {
+        Log.e(TAG, "❌ Error parseando mensaje", e)
+        Triple("", "", null)
     }
+}
+
 
     private suspend fun getParentDealer(phone: String): Agente? {
         val nro = phone.replace("+51", "")
@@ -573,7 +577,27 @@ class SmsReceiver : BroadcastReceiver() {
                 return
             }
 
-            // 4) Actualizamos la transacción a DELIVERED
+            // 4) Enviar registro a SAP B1 (tabla @ALLG_FISE_SMS vía /sl/fise/registrar-sms)
+            val agentePhone = transaction.agentePhone ?: driverPhone
+
+            val agente = FISE_SMS(
+                U_usr_dni = dni,
+                U_fise_codigo = cupon,
+                U_importe = importe,
+                U_descripcion = descripcion,
+                U_fise_numero = from,                 // número FISE que respondió
+                U_usr_numero = agentePhone,           // número del agente/supervisor
+                U_usr_chofer = driverPhone,           // número del chofer original
+                U_LLG_FISE_SN = transaction.sn        // 👈 aquí mandamos el SN a SAP
+            )
+
+            val sapSentSuccessfully = enviarBackendSap2(agente)
+            if (!sapSentSuccessfully) {
+                Log.e(TAG, "❌ Falló el envío al backend SAP después de $MAX_RETRIES intentos.")
+                // Aquí podrías decidir NO marcar DELIVERED si SAP falla.
+            }
+
+            // 5) Actualizamos la transacción a DELIVERED en SQLite
             transactionDao.updateTransaction(
                 cupon = cupon,
                 dni = dni,
@@ -582,7 +606,7 @@ class SmsReceiver : BroadcastReceiver() {
                 respuesta = descripcion
             )
 
-            // 5) Armamos el SMS para el chofer
+            // 6) Armamos el SMS para el chofer
             val textoChofer = if (importe != null) {
                 "Cupón $cupon validado. Importe por S/ $importe"
             } else {
@@ -754,7 +778,75 @@ class SmsReceiver : BroadcastReceiver() {
         }
     }
 
-    // 👇 NUEVO: debug para ver lo que hay en la tabla 'transactions'
+    // 👇 Envío al backend SAP para registrar en @ALLG_FISE_SMS
+    private suspend fun enviarBackendSap2(agente: FISE_SMS): Boolean = withContext(Dispatchers.IO) {
+        var success = false
+        var retries = 0
+        val startTime = System.currentTimeMillis()
+
+        while (!success && retries < MAX_RETRIES) {
+            try {
+                Log.d(TAG, "Iniciando enviarBackendSap2, intento ${retries + 1}")
+                val gson = Gson()
+                val jsonBody = gson.toJson(agente)
+                Log.d(TAG, "Cuerpo JSON a enviar: $jsonBody")
+
+                val url = URL("${URL_PATH}/sl/fise/registrar-sms")
+                val connection = url.openConnection() as HttpURLConnection
+                Log.d(TAG, "Conexión abierta a la URL: $url")
+
+                connection.apply {
+                    requestMethod = "POST"
+                    setRequestProperty("Content-Type", "application/json")
+                    connectTimeout = 10000
+                    readTimeout = 10000
+                    doOutput = true
+                }
+                Log.d(TAG, "Propiedades de la conexión establecidas")
+
+                connection.outputStream.use {
+                    it.write(jsonBody.toByteArray(Charsets.UTF_8))
+                }
+                Log.d(TAG, "Cuerpo de la solicitud enviado")
+
+                val responseCode = connection.responseCode
+                Log.d(TAG, "Código de respuesta recibido: $responseCode")
+
+                val response = if (responseCode == HttpURLConnection.HTTP_OK) {
+                    connection.inputStream.bufferedReader().use { it.readText() }
+                } else {
+                    connection.errorStream?.bufferedReader()?.use { it.readText() } ?: "Sin respuesta"
+                }
+
+                if (responseCode == HttpURLConnection.HTTP_OK) {
+                    Log.d(TAG, "✅ Backend SAP ($responseCode): $response")
+                    success = true
+                } else {
+                    Log.e(TAG, "❌ Error al enviar al backend SAP ($responseCode): $response")
+                    retries++
+                    if (retries < MAX_RETRIES) {
+                        Log.w(TAG, "🔄 Reintentando envío al backend SAP (Intento $retries/$MAX_RETRIES)...")
+                        delay(RETRY_DELAY_MS)
+                    }
+                }
+
+                connection.disconnect()
+            } catch (e: Exception) {
+                Log.e(TAG, "❌ Error al enviar al backend SAP: ${e.message}", e)
+                retries++
+                if (retries < MAX_RETRIES) {
+                    Log.w(TAG, "🔄 Reintentando envío al backend SAP (Intento $retries/$MAX_RETRIES)...")
+                    delay(RETRY_DELAY_MS)
+                }
+            }
+        }
+
+        val endTime = System.currentTimeMillis()
+        Log.d(TAG, "enviarBackendSap2 finalizado en ${endTime - startTime} ms")
+        return@withContext success
+    }
+
+    // 👇 Debug para ver lo que hay en la tabla 'transactions'
     private fun debugPrintLastTransactions() {
         try {
             val list = transactionDao.debugGetLastTransactions()
@@ -767,7 +859,8 @@ class SmsReceiver : BroadcastReceiver() {
                     Log.d(
                         TAG,
                         "TX -> cupon=${tx.cupon}, dni=${tx.dni}, estado=${tx.estado}, " +
-                            "driver=${tx.driverPhone}, entidad=${tx.entidad}, fecha=${tx.fecha}, monto=${tx.monto}"
+                            "driver=${tx.driverPhone}, entidad=${tx.entidad}, fecha=${tx.fecha}, " +
+                            "monto=${tx.monto}, sn=${tx.sn}"
                     )
                 }
             }

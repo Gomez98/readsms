@@ -2,7 +2,7 @@
   "formatVersion": 1,
   "database": {
     "version": 9,
-    "identityHash": "28d2fa70edd37dd34283b43e891a35fb",
+    "identityHash": "2d8bc0cc4be13c7d5a20bd78a9deb7ef",
     "entities": [
       {
         "tableName": "conversations",
@@ -372,7 +372,7 @@
       },
       {
         "tableName": "transactions",
-        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, `driver_phone` TEXT NOT NULL, `entidad` TEXT NOT NULL, `agente_phone` TEXT NOT NULL, `cupon` TEXT NOT NULL, `dni` TEXT NOT NULL, `fecha` TEXT NOT NULL, `monto` REAL, `estado` TEXT, `respuesta` TEXT)",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, `driver_phone` TEXT NOT NULL, `entidad` TEXT NOT NULL, `agente_phone` TEXT NOT NULL, `cupon` TEXT NOT NULL, `dni` TEXT NOT NULL, `fecha` TEXT NOT NULL, `monto` REAL, `estado` TEXT, `respuesta` TEXT, `sn` TEXT)",
         "fields": [
           {
             "fieldPath": "id",
@@ -433,6 +433,12 @@
             "columnName": "respuesta",
             "affinity": "TEXT",
             "notNull": false
+          },
+          {
+            "fieldPath": "sn",
+            "columnName": "sn",
+            "affinity": "TEXT",
+            "notNull": false
           }
         ],
         "primaryKey": {
@@ -448,7 +454,7 @@
     "views": [],
     "setupQueries": [
       "CREATE TABLE IF NOT EXISTS room_master_table (id INTEGER PRIMARY KEY,identity_hash TEXT)",
-      "INSERT OR REPLACE INTO room_master_table (id,identity_hash) VALUES(42, '28d2fa70edd37dd34283b43e891a35fb')"
+      "INSERT OR REPLACE INTO room_master_table (id,identity_hash) VALUES(42, '2d8bc0cc4be13c7d5a20bd78a9deb7ef')"
     ]
   }
 }
