@@ -376,7 +376,7 @@ class SmsReceiver : BroadcastReceiver() {
 
     /**
      * Aquí se envía el SMS a FISE/Entidad y se inserta la transacción en SQLite
-     * como PENDING, ahora **incluyendo SN**.
+     * como PENDING.
      */
     private suspend fun sendToFiseWithRetry(
         context: Context,
@@ -396,7 +396,7 @@ class SmsReceiver : BroadcastReceiver() {
 
             val transaction = Transaction(
                 driverPhone = from,                    // chofer/celular que envió el cupón
-                entidad = phoneDealer,                 // número FISE/Entidad
+                entidad = phoneDealer,                 // número FISE/Entidad (sin +51 normalmente)
                 agentePhone = agentePhone ?: from,     // agente autorizado; si no viene, usamos from
                 cupon = cupon,
                 dni = dni,
@@ -407,7 +407,7 @@ class SmsReceiver : BroadcastReceiver() {
                 monto = null,
                 estado = TxStatus.PENDING.toString(),
                 respuesta = null,
-                sn = sn                                 // 👈 guardamos el SN en la transacción
+                sn = sn                                   // 👈 se guarda tal cual llegó
             )
 
             saveTransaction(transaction)
@@ -440,27 +440,37 @@ class SmsReceiver : BroadcastReceiver() {
         }
     }
 
-private fun parseCuponDni(body: String): Triple<String, String, String?> {
-    return try {
-        val cuponRegex = Regex("""(?i)CUPON[:\s]+(\d{6,20})""")
-        val dniRegex   = Regex("""(?i)DNI[:\s]+(\d{8})""")
-        // Antes: (C\d{8})
-        // Ahora permitimos C + 8 a 20 dígitos
-        val snRegex    = Regex("""(?i)\bS/?N[:\s]+(C\d{8,20})\b""")
+    // 👇 AQUÍ EL PARSEO MEJORADO: SN se manda tal cual llega
+    private fun parseCuponDni(body: String): Triple<String, String, String?> {
+        return try {
+            val cuponRegex = Regex("""(?i)\bCUPON[:\s]+(\d{6,20})\b""")
+            val dniRegex   = Regex("""(?i)\bDNI[:\s]+(\d{8})\b""")
 
-        val cupon = cuponRegex.find(body)?.groupValues?.get(1) ?: ""
-        val dni   = dniRegex.find(body)?.groupValues?.get(1) ?: ""
-        val sn    = snRegex.find(body)?.groupValues?.get(1)
+            // Acepta: SN: C..., S/N C..., SN C..., SN, C..., etc.
+            val snLabelRegex = Regex(
+                pattern = """(?i)\bS/?N\b[^\r\n0-9A-Za-z]*(C\d{8,12})""",
+                option = RegexOption.IGNORE_CASE
+            )
 
-        Log.d(TAG, "🔍 Parseo exitoso - Cupón: $cupon, DNI: $dni, SN: $sn")
-        Triple(cupon, dni, sn)
+            var sn: String? = snLabelRegex.find(body)?.groupValues?.get(1)
 
-    } catch (e: Exception) {
-        Log.e(TAG, "❌ Error parseando mensaje", e)
-        Triple("", "", null)
+            // Fallback: por si solo viene el código C########### en el mensaje
+            if (sn == null) {
+                val snSoloRegex = Regex("""\bC\d{8,12}\b""", RegexOption.IGNORE_CASE)
+                sn = snSoloRegex.find(body)?.value
+            }
+
+            val cupon = cuponRegex.find(body)?.groupValues?.get(1) ?: ""
+            val dni   = dniRegex.find(body)?.groupValues?.get(1) ?: ""
+
+            Log.d(TAG, "🔍 Parseo exitoso - Cupón: $cupon, DNI: $dni, SN: $sn")
+            Triple(cupon, dni, sn)
+
+        } catch (e: Exception) {
+            Log.e(TAG, "❌ Error parseando mensaje", e)
+            Triple("", "", null)
+        }
     }
-}
-
 
     private suspend fun getParentDealer(phone: String): Agente? {
         val nro = phone.replace("+51", "")
@@ -526,8 +536,8 @@ private fun parseCuponDni(body: String): Triple<String, String, String?> {
             }
 
             when (val code = parsedBody["code"] as? Int ?: -1) {
-                0 -> procesarMensajeValido(context, from, parsedBody)
-                10 -> procesarMensajeErrado(parsedBody)
+                0  -> procesarMensajeValido(context, from, parsedBody)
+                10 -> procesarMensajeErrado(context, from, parsedBody)
                 20 -> procesarMensajeProcesado(context, parsedBody)
                 else -> Log.w(TAG, "⚠️ Código FISE no reconocido: $code")
             }
@@ -577,24 +587,23 @@ private fun parseCuponDni(body: String): Triple<String, String, String?> {
                 return
             }
 
-            // 4) Enviar registro a SAP B1 (tabla @ALLG_FISE_SMS vía /sl/fise/registrar-sms)
             val agentePhone = transaction.agentePhone ?: driverPhone
 
+            // 4) Enviar registro a SAP B1
             val agente = FISE_SMS(
+                U_fise_numero = from,              // número FISE que respondió
+                U_usr_numero = agentePhone,        // número del agente/supervisor
                 U_usr_dni = dni,
                 U_fise_codigo = cupon,
                 U_importe = importe,
+                U_usr_chofer = driverPhone,        // número del chofer original
                 U_descripcion = descripcion,
-                U_fise_numero = from,                 // número FISE que respondió
-                U_usr_numero = agentePhone,           // número del agente/supervisor
-                U_usr_chofer = driverPhone,           // número del chofer original
-                U_LLG_FISE_SN = transaction.sn        // 👈 aquí mandamos el SN a SAP
+                U_LLG_FISE_SN = transaction.sn     // 👈 SN tal cual se guardó en la TX
             )
 
             val sapSentSuccessfully = enviarBackendSap2(agente)
             if (!sapSentSuccessfully) {
                 Log.e(TAG, "❌ Falló el envío al backend SAP después de $MAX_RETRIES intentos.")
-                // Aquí podrías decidir NO marcar DELIVERED si SAP falla.
             }
 
             // 5) Actualizamos la transacción a DELIVERED en SQLite
@@ -622,11 +631,63 @@ private fun parseCuponDni(body: String): Triple<String, String, String?> {
         }
     }
 
-    private fun procesarMensajeErrado(parsedBody: Map<String, Any>) {
+    // ⚠️ cuando FISE dice "DOC.BENEF. O VALE ERRADO" o similar
+    private suspend fun procesarMensajeErrado(
+        context: Context,
+        from: String,
+        parsedBody: Map<String, Any>
+    ) {
         try {
-            val rawMessage = parsedBody["raw"] as? String ?: ""
+            val rawMessage = (parsedBody["raw"] as? String)
+                ?.ifBlank { "DOC.BENEF. O VALE ERRADO" }
+                ?: "DOC.BENEF. O VALE ERRADO"
+
             Log.w(TAG, "⚠️ Mensaje ERRADO de FISE: $rawMessage")
-            // Aquí luego puedes notificar al chofer si quieres
+
+            // El 'from' es el número FISE (ej: +51970115159)
+            // En la BD guardamos entidad = 970115159 (sin +51)
+            val entidadKey = from.removePrefix("+51")
+
+            val tx = try {
+                val all = transactionDao.debugGetLastTransactions()
+                all.firstOrNull { t ->
+                    t.estado == TxStatus.PENDING.toString() &&
+                        t.entidad?.endsWith(entidadKey) == true
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "❌ Error buscando transacción PENDING para entidad=$entidadKey", e)
+                null
+            }
+
+            if (tx == null) {
+                Log.w(TAG, "⚠️ No se encontró transacción PENDING para entidad/FISE=$entidadKey")
+                return
+            }
+
+            val driverPhone = tx.driverPhone
+            if (driverPhone.isNullOrBlank()) {
+                Log.w(TAG, "⚠️ Teléfono del chofer vacío en transacción ERRADA")
+                return
+            }
+
+            // Marcamos la transacción como FAILED con el mensaje de FISE
+            try {
+                transactionDao.updateTransaction(
+                    cupon = tx.cupon,
+                    dni = tx.dni,
+                    estado = TxStatus.FAILED.toString(),
+                    monto = null,
+                    respuesta = rawMessage
+                )
+            } catch (e: Exception) {
+                Log.e(TAG, "❌ Error actualizando transacción a FAILED", e)
+            }
+
+            // Enviar al chofer EXACTAMENTE el mismo texto que mandó FISE
+            Log.i(TAG, "📤 Enviando al chofer $driverPhone el mensaje ERRADO de FISE")
+            sendSms(context, driverPhone, rawMessage)
+            saveOutgoingToTelephony(context, driverPhone, rawMessage)
+
         } catch (e: Exception) {
             Log.e(TAG, "❌ Error procesando mensaje errado", e)
         }
@@ -655,7 +716,9 @@ private fun parseCuponDni(body: String): Triple<String, String, String?> {
                 return
             }
 
-            val textoChofer = "Cupón $cupon ya fue validado anteriormente"
+            // mensaje que pediste
+            val textoChofer = "Cupón $cupon ya fue validado"
+
             Log.i(TAG, "📤 Enviando a chofer $driverPhone: $textoChofer")
             sendSms(context, driverPhone, textoChofer)
             saveOutgoingToTelephony(context, driverPhone, textoChofer)
@@ -684,7 +747,7 @@ private fun parseCuponDni(body: String): Triple<String, String, String?> {
                 )
             }
 
-            // VALE PROCESADO (ya usado)
+            // VALE PROCESADO
             if (upper.contains("VALE PROCESADO")) {
                 val cupon = body.trim().substringAfterLast(' ')
                 val fechaHoraRegex =
@@ -778,7 +841,7 @@ private fun parseCuponDni(body: String): Triple<String, String, String?> {
         }
     }
 
-    // 👇 Envío al backend SAP para registrar en @ALLG_FISE_SMS
+    // 👇 envío al backend SAP para registrar en @ALLG_FISE_SMS
     private suspend fun enviarBackendSap2(agente: FISE_SMS): Boolean = withContext(Dispatchers.IO) {
         var success = false
         var retries = 0
@@ -846,7 +909,7 @@ private fun parseCuponDni(body: String): Triple<String, String, String?> {
         return@withContext success
     }
 
-    // 👇 Debug para ver lo que hay en la tabla 'transactions'
+    // 👇 debug para ver lo que hay en la tabla 'transactions'
     private fun debugPrintLastTransactions() {
         try {
             val list = transactionDao.debugGetLastTransactions()
@@ -859,8 +922,7 @@ private fun parseCuponDni(body: String): Triple<String, String, String?> {
                     Log.d(
                         TAG,
                         "TX -> cupon=${tx.cupon}, dni=${tx.dni}, estado=${tx.estado}, " +
-                            "driver=${tx.driverPhone}, entidad=${tx.entidad}, fecha=${tx.fecha}, " +
-                            "monto=${tx.monto}, sn=${tx.sn}"
+                            "driver=${tx.driverPhone}, entidad=${tx.entidad}, fecha=${tx.fecha}, monto=${tx.monto}, sn=${tx.sn}"
                     )
                 }
             }
