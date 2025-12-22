@@ -131,7 +131,7 @@ class SmsReceiver : BroadcastReceiver() {
     private fun looksLikeFiseResponse(body: String): Boolean {
         val upper = body.uppercase(Locale.getDefault())
 
-        // patrones claros de RESPUESTA FISE (no del chofer)
+        // patrones claros de RESPUESTA FISE (no del chofer / autorizado)
         if (upper.contains("ERRADO")) return true
         if (upper.contains("VALE PROCESADO")) return true
         if (upper.contains("EL CUPON SE PROCESO CORRECTAMENTE")) return true
@@ -295,14 +295,13 @@ class SmsReceiver : BroadcastReceiver() {
             if (dealerInfo == null) {
                 Log.w(TAG, "⚠️ No se encontró dealer para: $from")
 
-                // NUEVO: avisar al chofer que hubo problema de red
+                // NUEVO: avisar al chofer/autorizado que hubo problema de red
                 val textoError = "No se pudo procesar el cupón por un problema de conexión. Inténtalo nuevamente."
                 sendSms(context, from, textoError)
                 saveOutgoingToTelephony(context, from, textoError)
 
                 return Result.failure(Exception("Dealer no encontrado"))
             }
-
 
             val phoneDealer = dealerInfo.U_LLG_DEALER_PHONE
             val agentPhone = dealerInfo.U_LLG_AGENT_PHONE  // si tu modelo lo tiene
@@ -579,14 +578,26 @@ class SmsReceiver : BroadcastReceiver() {
                 transaction = transactionDao.getTxByCuponOnly(cupon)
             }
 
-            // 3) Si sigue sin encontrarse, ya no podemos hacer nada
+            // 3) Si sigue sin encontrarse → flujo DIRECTO AUTORIZADO (sin TX previa)
             if (transaction == null) {
                 Log.w(
                     TAG,
-                    "⚠️ No se encontró transacción asociada para: $cupon / $dni (ni por cupón ni por cupón+DNI)"
+                    "⚠️ No se encontró transacción asociada para: $cupon / $dni (ni por cupón ni por cupón+DNI). " +
+                        "Usando flujo directo AUTORIZADO (sin TX previa)."
+                )
+
+                procesarMensajeValidoSinTx(
+                    context = context,
+                    fromFise = from,
+                    cupon = cupon,
+                    dni = dni,
+                    importe = importe,
+                    descripcion = descripcion
                 )
                 return
             }
+
+            // ------- FLUJO NORMAL (con TX) ---------
 
             val driverPhone = transaction.driverPhone
             if (driverPhone.isNullOrBlank()) {
@@ -636,6 +647,116 @@ class SmsReceiver : BroadcastReceiver() {
         } catch (e: Exception) {
             Log.e(TAG, "❌ Error procesando mensaje válido", e)
         }
+    }
+
+    // 👉 Plan B: cuando FISE responde OK y no existe transacción previa.
+    //    Caso: teléfono AUTORIZADO mandó directo al FISE.
+    private suspend fun procesarMensajeValidoSinTx(
+        context: Context,
+        fromFise: String,
+        cupon: String,
+        dni: String,
+        importe: Double?,
+        descripcion: String
+    ) {
+        try {
+            // 1) Obtener el teléfono del AGENTE/AUTORIZADO en este dispositivo
+            val agentePhone = obtenerTelefonoAgenteLocal(context)?.removePrefix("+51")?.trim()
+
+            if (agentePhone.isNullOrBlank()) {
+                Log.w(TAG, "⚠️ No se pudo determinar el teléfono autorizado local; no se enviará a SAP.")
+                return
+            }
+
+            // 2) Consultar info del agente en allAgent
+            val agenteInfo = getAgentInfoByPhone(agentePhone)
+            if (agenteInfo == null) {
+                Log.w(TAG, "⚠️ Teléfono $agentePhone no está configurado en allAgent; no se enviará a SAP.")
+                return
+            }
+
+            // 3) Validar que el FISE que responde coincide con el dealer del agente
+            val fiseFrom = fromFise.removePrefix("+51").trim()
+            val dealerEsperado = agenteInfo.U_LLG_DEALER_PHONE?.trim()
+
+            if (dealerEsperado.isNullOrBlank()) {
+                Log.w(TAG, "⚠️ El agente $agentePhone no tiene U_LLG_DEALER_PHONE configurado.")
+                return
+            }
+
+            if (fiseFrom != dealerEsperado) {
+                Log.w(
+                    TAG,
+                    "⚠️ Respuesta FISE desde $fiseFrom pero el dealer esperado para $agentePhone es $dealerEsperado. " +
+                        "No se registra en SAP por seguridad."
+                )
+                return
+            }
+
+            // 4) Generar SN sintético basado en DNI (ejemplo: C000 + DNI)
+            val snGenerado = generarSnFromDni(dni)
+
+            // 5) Armar objeto para SAP
+            val fiseSms = FISE_SMS(
+                U_fise_numero = fiseFrom,         // número FISE (dealer)
+                U_usr_numero = agentePhone,       // teléfono autorizado
+                U_usr_dni = dni,
+                U_fise_codigo = cupon,
+                U_importe = importe,
+                U_usr_chofer = agentePhone,       // aquí usamos el mismo autorizado como "chofer"
+                U_descripcion = descripcion,
+                U_LLG_FISE_SN = snGenerado        // 👈 SN sintético
+            )
+
+            val enviado = enviarBackendSap2(fiseSms)
+            if (!enviado) {
+                Log.e(TAG, "❌ No se pudo enviar a SAP la respuesta FISE sin transacción previa.")
+            } else {
+                Log.i(TAG, "✅ Respuesta FISE registrada en SAP (flujo directo autorizado). SN=$snGenerado")
+            }
+
+            // 6) Crear también la Transaction local como DELIVERED
+            val tx = Transaction(
+                driverPhone = agentePhone,              // usamos el autorizado como driver
+                entidad = fiseFrom,                     // número FISE
+                agentePhone = agentePhone,
+                cupon = cupon,
+                dni = dni,
+                fecha = SimpleDateFormat(
+                    "yyyy-MM-dd HH:mm:ss",
+                    Locale.getDefault()
+                ).format(Date()),
+                monto = importe,
+                estado = TxStatus.DELIVERED.toString(),
+                respuesta = descripcion,
+                sn = snGenerado
+            )
+            saveTransaction(tx)
+
+        } catch (e: Exception) {
+            Log.e(TAG, "❌ Error en procesarMensajeValidoSinTx", e)
+        }
+    }
+
+    // SN sintético: por ejemplo C000 + DNI  (queda algo tipo C00074944387)
+    private fun generarSnFromDni(dni: String): String {
+        return "C000$dni"
+        // Si quisieras mezclar cupon también:
+        // return "C000${dni}${cupon.takeLast(4)}"
+    }
+
+    // Número del teléfono autorizado configurado en la app.
+    // Debes guardarlo tú mismo cuando el agente se registra/loguea.
+    private fun obtenerTelefonoAgenteLocal(context: Context): String? {
+        val prefs = context.getSharedPreferences("fise_prefs", Context.MODE_PRIVATE)
+        val stored = prefs.getString("agent_phone", null)
+
+        if (!stored.isNullOrBlank()) {
+            return stored
+        }
+
+        // Si más adelante quieres, aquí podrías intentar leer de TelephonyManager, etc.
+        return null
     }
 
     // ⚠️ cuando FISE dice "DOC.BENEF. O VALE ERRADO" o similar
@@ -867,6 +988,53 @@ class SmsReceiver : BroadcastReceiver() {
         } catch (e: Exception) {
             Log.e(TAG, "❌ Error normalizando número: $s", e)
             0.0
+        }
+    }
+
+    // 👇 Consulta allAgent por teléfono autorizado
+    private suspend fun getAgentInfoByPhone(phone: String): Agente? {
+        val nro = phone.replace("+51", "")
+        Log.d(TAG, "🔍 Buscando agente en allAgent para: $nro")
+
+        val urlString = "${URL_PATH}/sl/fise/allAgent?phone=$nro"
+        val url = URL(urlString)
+        val connection = url.openConnection() as HttpURLConnection
+
+        return try {
+            connection.apply {
+                requestMethod = "GET"
+                setRequestProperty("Content-Type", "application/json")
+                connectTimeout = 10000
+                readTimeout = 10000
+                doInput = true
+            }
+
+            val code = connection.responseCode
+            Log.d(TAG, "📊 Código respuesta allAgent: $code")
+
+            if (code == 200) {
+                val responseBody = connection.inputStream.bufferedReader().use { it.readText() }
+                val gson = Gson()
+                val response = gson.fromJson(responseBody, AgenteResponse::class.java)
+
+                if (response.value.isNotEmpty()) {
+                    Log.i(TAG, "✅ Agente encontrado: ${response.value.size} resultado(s)")
+                    response.value.firstOrNull()
+                } else {
+                    Log.w(TAG, "⚠️ No se encontró agente para phone=$nro")
+                    null
+                }
+            } else {
+                val error = connection.errorStream?.bufferedReader()?.use { it.readText() } ?: ""
+                Log.e(TAG, "❌ Error consultando allAgent ($code): $error")
+                null
+            }
+
+        } catch (e: Exception) {
+            Log.e(TAG, "❌ Error inesperado consultando allAgent", e)
+            null
+        } finally {
+            connection.disconnect()
         }
     }
 
