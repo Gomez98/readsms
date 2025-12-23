@@ -450,7 +450,7 @@ class SmsReceiver : BroadcastReceiver() {
     private fun parseCuponDni(body: String): Triple<String, String, String?> {
         return try {
             val cuponRegex = Regex("""(?i)\bCUPON[:\s]+(\d{6,20})\b""")
-            val dniRegex   = Regex("""(?i)\bDNI[:\s]+(\d{8})\b""")
+            val dniRegex = Regex("""(?i)\bDNI[:\s]+(\d{8})\b""")
 
             // Acepta: SN: C..., S/N C..., SN C..., SN, C..., etc.
             val snLabelRegex = Regex(
@@ -467,7 +467,7 @@ class SmsReceiver : BroadcastReceiver() {
             }
 
             val cupon = cuponRegex.find(body)?.groupValues?.get(1) ?: ""
-            val dni   = dniRegex.find(body)?.groupValues?.get(1) ?: ""
+            val dni = dniRegex.find(body)?.groupValues?.get(1) ?: ""
 
             Log.d(TAG, "🔍 Parseo exitoso - Cupón: $cupon, DNI: $dni, SN: $sn")
             Triple(cupon, dni, sn)
@@ -542,9 +542,9 @@ class SmsReceiver : BroadcastReceiver() {
             }
 
             when (val code = parsedBody["code"] as? Int ?: -1) {
-                0  -> procesarMensajeValido(context, from, parsedBody)
+                0 -> procesarMensajeValido(context, from, parsedBody)
                 10 -> procesarMensajeErrado(context, from, parsedBody)
-                20 -> procesarMensajeProcesado(context, parsedBody)
+                20 -> procesarMensajeProcesado(context, from, parsedBody)
                 else -> Log.w(TAG, "⚠️ Código FISE no reconocido: $code")
             }
 
@@ -741,8 +741,6 @@ class SmsReceiver : BroadcastReceiver() {
     // SN sintético: por ejemplo C000 + DNI  (queda algo tipo C00074944387)
     private fun generarSnFromDni(dni: String): String {
         return "C000$dni"
-        // Si quisieras mezclar cupon también:
-        // return "C000${dni}${cupon.takeLast(4)}"
     }
 
     // Número del teléfono autorizado configurado en la app.
@@ -755,7 +753,6 @@ class SmsReceiver : BroadcastReceiver() {
             return stored
         }
 
-        // Si más adelante quieres, aquí podrías intentar leer de TelephonyManager, etc.
         return null
     }
 
@@ -774,7 +771,7 @@ class SmsReceiver : BroadcastReceiver() {
 
             // El 'from' es el número FISE (ej: +51970115159)
             // En la BD guardamos entidad = 970115159 (sin +51)
-            val entidadKey = from.removePrefix("+51")
+            val entidadKey = from.removePrefix("+51").trim()
 
             val tx = try {
                 val all = transactionDao.debugGetLastTransactions()
@@ -821,35 +818,76 @@ class SmsReceiver : BroadcastReceiver() {
         }
     }
 
+    // ✅ MODIFICADO: VALE PROCESADO ahora reenvía al chofer:
+    // - Fecha/Hora (del SMS)
+    // - Cupón real y DNI (de la TX PENDING)
+    // - Entidad donde se usó (del SMS, último número grande)
     private suspend fun procesarMensajeProcesado(
         context: Context,
+        from: String,
         parsedBody: Map<String, Any>
     ) {
         try {
-            val cupon = parsedBody["cupon"] as? String ?: return
-            val fecha = parsedBody["fecha"] as? String
-            val hora = parsedBody["hora"] as? String
+            val rawMessage = (parsedBody["raw"] as? String)
+                ?.trim()
+                ?.ifBlank { "VALE PROCESADO" }
+                ?: "VALE PROCESADO"
 
-            Log.i(TAG, "📋 Cupón ya procesado: $cupon (Fecha: $fecha, Hora: $hora)")
+            val fecha = (parsedBody["fecha"] as? String)?.trim().orEmpty()
+            val hora = (parsedBody["hora"] as? String)?.trim().orEmpty()
+            val entidadUsada = (parsedBody["entidadUsada"] as? String)?.trim().orEmpty()
 
-            val transaction = transactionDao.getTxByCuponOnly(cupon)
-            if (transaction == null) {
-                Log.w(TAG, "⚠️ No se encontró transacción para cupón procesado: $cupon")
+            Log.i(TAG, "📋 VALE PROCESADO recibido desde $from: ${rawMessage.take(80)}...")
+
+            // Buscar última PENDING por entidad (número FISE que respondió)
+            val entidadKey = from.removePrefix("+51").trim()
+
+            val tx = try {
+                val all = transactionDao.debugGetLastTransactions()
+                all.firstOrNull { t ->
+                    t.estado == TxStatus.PENDING.toString() &&
+                        t.entidad?.endsWith(entidadKey) == true
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "❌ Error buscando transacción PENDING para entidad=$entidadKey", e)
+                null
+            }
+
+            if (tx == null) {
+                Log.w(TAG, "⚠️ No se encontró transacción PENDING para entidad/FISE=$entidadKey")
                 return
             }
 
-            val driverPhone = transaction.driverPhone
+            val driverPhone = tx.driverPhone
             if (driverPhone.isNullOrBlank()) {
-                Log.w(TAG, "⚠️ Teléfono del chofer no disponible")
+                Log.w(TAG, "⚠️ Teléfono del chofer no disponible en TX PENDING")
                 return
             }
 
-            // mensaje que pediste
-            val textoChofer = "Cupón $cupon ya fue validado"
+            val textoChofer = buildString {
+                append("VALE FISE PROCESADO")
 
-            Log.i(TAG, "📤 Enviando a chofer $driverPhone: $textoChofer")
+                val fh = "${fecha} ${hora}".trim()
+                if (fh.isNotBlank()) append("\nFECHA: $fh")
+
+                if (!tx.cupon.isNullOrBlank()) append("\nCUPON: ${tx.cupon}")
+                if (!tx.dni.isNullOrBlank()) append("\nDNI: ${tx.dni}")
+
+                if (entidadUsada.isNotBlank()) append("\nENTIDAD: $entidadUsada")
+            }
+
+            Log.i(TAG, "📤 Enviando al chofer $driverPhone el mensaje PROCESADO (con cupón real y entidad usada)")
             sendSms(context, driverPhone, textoChofer)
             saveOutgoingToTelephony(context, driverPhone, textoChofer)
+
+            // (Opcional) si no quieres que quede PENDING eternamente, descomenta:
+            // transactionDao.updateTransaction(
+            //     cupon = tx.cupon,
+            //     dni = tx.dni,
+            //     estado = TxStatus.FAILED.toString(), // o PROCESSED si tienes ese estado
+            //     monto = null,
+            //     respuesta = rawMessage
+            // )
 
         } catch (e: Exception) {
             Log.e(TAG, "❌ Error procesando mensaje procesado", e)
@@ -876,23 +914,11 @@ class SmsReceiver : BroadcastReceiver() {
             }
 
             // ✅ VALE PROCESADO (ya usado / cupón procesado)
+            // ✅ OJO: el número grande final NO es cupón, es la ENTIDAD donde se usó
             if (upper.contains("VALE PROCESADO")) {
                 val lines = body.lines()
                     .map { it.trim() }
                     .filter { it.isNotEmpty() }
-
-                // Buscar la última línea que sea solo números y con longitud razonable (6-20)
-                val cupon = lines.lastOrNull { line ->
-                    line.all { ch -> ch.isDigit() } && line.length in 6..20
-                } ?: run {
-                    // Fallback: último grupo de 6–20 dígitos en todo el cuerpo
-                    Regex("""(\d{6,20})""")
-                        .findAll(body)
-                        .lastOrNull()
-                        ?.groupValues
-                        ?.get(1)
-                        ?: ""
-                }
 
                 // Soportar:
                 // - 2025/10/10 15:31:43
@@ -901,17 +927,22 @@ class SmsReceiver : BroadcastReceiver() {
                     """(\d{4}/\d{2}/\d{2}|\d{2}/\d{2}/\d{4})\s+([0-2]\d:[0-5]\d(?::[0-5]\d)?)"""
                 )
                 val match = fechaHoraRegex.find(body)
-                val fecha = match?.groupValues?.get(1)
-                val hora = match?.groupValues?.get(2)
+                val fecha = match?.groupValues?.get(1).orEmpty()
+                val hora = match?.groupValues?.get(2).orEmpty()
 
-                Log.d(TAG, "🔍 VALE PROCESADO parseado - Cupón: $cupon, Fecha: $fecha, Hora: $hora")
+                // ✅ última línea numérica grande = ENTIDAD donde se utilizó
+                val entidadUsada = lines.lastOrNull { line ->
+                    line.all { ch -> ch.isDigit() } && line.length in 6..30
+                }.orEmpty()
+
+                Log.d(TAG, "🔍 VALE PROCESADO parseado - Fecha: $fecha, Hora: $hora, EntidadUsada: $entidadUsada")
 
                 return mapOf(
                     "code" to 20,
                     "mensaje" to "VALE PROCESADO",
-                    "fecha" to (fecha ?: ""),
-                    "hora" to (hora ?: ""),
-                    "cupon" to cupon,
+                    "fecha" to fecha,
+                    "hora" to hora,
+                    "entidadUsada" to entidadUsada,
                     "raw" to body
                 )
             }
