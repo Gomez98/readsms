@@ -931,9 +931,13 @@ class SmsReceiver : BroadcastReceiver() {
                 val hora = match?.groupValues?.get(2).orEmpty()
 
                 // ✅ última línea numérica grande = ENTIDAD donde se utilizó
-                val entidadUsada = lines.lastOrNull { line ->
-                    line.all { ch -> ch.isDigit() } && line.length in 6..30
-                }.orEmpty()
+                // MODIFICADO: Usamos Regex para buscar el último bloque numérico largo (10+ dígitos)
+                // esto funciona aunque llegue todo en una sola línea.
+                val entidadRegex = Regex("""\b\d{10,30}\b""")
+                val entidadUsada = entidadRegex.findAll(body)
+                    .map { it.value }
+                    .lastOrNull()
+                    .orEmpty()
 
                 Log.d(TAG, "🔍 VALE PROCESADO parseado - Fecha: $fecha, Hora: $hora, EntidadUsada: $entidadUsada")
 
