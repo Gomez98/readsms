@@ -17,7 +17,7 @@ import com.simplemobiletools.smsmessenger.models.*
     Message::class,
     RecycleBinMessage::class,
     MensajeFiltrado::class,
-    Transaction::class], version = 9)
+    Transaction::class], version = 10)
 @TypeConverters(Converters::class)
 abstract class MessagesDatabase : RoomDatabase() {
 
@@ -50,6 +50,7 @@ abstract class MessagesDatabase : RoomDatabase() {
                             .addMigrations(MIGRATION_6_7)
                             .addMigrations(MIGRATION_7_8)
                             .addMigrations(MIGRATION_8_9)
+                            .addMigrations(MIGRATION_9_10)
                             .build()
                     }
                 }
@@ -148,6 +149,12 @@ abstract class MessagesDatabase : RoomDatabase() {
                         respuesta TEXT
                     )
                 """.trimIndent())
+            }
+        }
+
+        private val MIGRATION_9_10 = object : Migration(9, 10) {
+            override fun migrate(database: SupportSQLiteDatabase) {
+                database.execSQL("ALTER TABLE transactions ADD COLUMN sn TEXT")
             }
         }
     }

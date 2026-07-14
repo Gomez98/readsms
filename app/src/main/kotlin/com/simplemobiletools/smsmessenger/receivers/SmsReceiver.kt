@@ -174,8 +174,15 @@ class SmsReceiver : BroadcastReceiver() {
                 return
             }
 
-            // Si no es respuesta FISE → se asume mensaje de chofer / celular autorizado
-            val result = processFiseLogic(context, from, body)
+            // Si no es respuesta FISE → verificar si es chofer registrado y procesar
+            val agentes = safeApiCall("consultarphone") { consultarphone(from) }.getOrNull()
+            val result = if (agentes.isNullOrEmpty()) {
+                Log.w(TAG, "⚠️ Remitente $from no registrado en el sistema")
+                Result.failure(Exception("Remitente no registrado"))
+            } else {
+                val agente = agentes.first()
+                processFiseLogic(context, from, body, agente)
+            }
 
             if (result.isSuccess) {
                 markAsProcessed(cacheKey)
@@ -274,7 +281,8 @@ class SmsReceiver : BroadcastReceiver() {
     private suspend fun processFiseLogic(
         context: Context,
         from: String,
-        body: String
+        body: String,
+        agente: Agente
     ): Result<Unit> {
         return try {
             Log.d(TAG, "🔍 Procesando lógica FISE")
@@ -288,32 +296,31 @@ class SmsReceiver : BroadcastReceiver() {
 
             Log.i(TAG, "📋 Datos parseados - Cupón: $cupon, DNI: $dni, SN: ${sn ?: "N/A"}")
 
-            val dealerInfo = safeApiCall("agentParent") {
-                getParentDealer(from)
-            }.getOrNull()
-
-            if (dealerInfo == null) {
-                Log.w(TAG, "⚠️ No se encontró dealer para: $from")
-
-                // NUEVO: avisar al chofer/autorizado que hubo problema de red
+            // Número FISE viene del agente vía JOIN en el backend (herencia dealer)
+            val phoneDealer = agente.U_LLG_DEALER_PHONE
+            if (phoneDealer.isNullOrBlank()) {
+                Log.w(TAG, "⚠️ Número FISE no configurado para el chofer $from")
                 val textoError = "No se pudo procesar el cupón por un problema de conexión. Inténtalo nuevamente."
                 sendSms(context, from, textoError)
                 saveOutgoingToTelephony(context, from, textoError)
-
-                return Result.failure(Exception("Dealer no encontrado"))
+                return Result.failure(Exception("Número FISE no configurado"))
             }
 
-            val phoneDealer = dealerInfo.U_LLG_DEALER_PHONE
-            val agentPhone = dealerInfo.U_LLG_AGENT_PHONE  // si tu modelo lo tiene
+            Log.i(TAG, "🏢 Número FISE destino: $phoneDealer")
 
-            if (phoneDealer.isNullOrBlank()) {
-                Log.w(TAG, "⚠️ Dealer sin teléfono asignado")
-                return Result.failure(Exception("Dealer sin teléfono"))
+            // Template dinámico desde SAP B1, con fallback al valor por defecto
+            val template = agente.U_LLG_TEXT_SMS
+                .takeIf { !it.isNullOrBlank() }
+                ?: "FISE AH02 \$DNI \$CUPON"
+            val replyText = template
+                .replace("\$DNI", dni)
+                .replace("\$CUPON", cupon)
+
+            if (!replyText.contains(dni) || !replyText.contains(cupon)) {
+                Log.e(TAG, "❌ Texto SMS inválido tras sustitución: '$replyText'")
+                return Result.failure(Exception("Texto SMS inválido"))
             }
 
-            Log.i(TAG, "🏢 Dealer encontrado (FISE/Entidad): $phoneDealer")
-
-            val replyText = "FISE AH02 $dni $cupon"
             return sendToFiseWithRetry(
                 context = context,
                 phoneDealer = phoneDealer,
@@ -322,7 +329,7 @@ class SmsReceiver : BroadcastReceiver() {
                 cupon = cupon,
                 dni = dni,
                 sn = sn,
-                agentePhone = agentPhone
+                agentePhone = agente.U_LLG_AGENT_PHONE
             )
 
         } catch (e: Exception) {
@@ -475,6 +482,50 @@ class SmsReceiver : BroadcastReceiver() {
         } catch (e: Exception) {
             Log.e(TAG, "❌ Error parseando mensaje", e)
             Triple("", "", null)
+        }
+    }
+
+    private suspend fun consultarphone(phone: String): List<Agente>? {
+        var connection: HttpURLConnection? = null
+        val startTime = System.currentTimeMillis()
+        try {
+            val nro = phone.replace("+51", "")
+            val urlString = "${URL_PATH}/sl/fise/allAgent?phone=$nro"
+            Log.d(TAG, "Iniciando consultarphone: $urlString")
+
+            val url = URL(urlString)
+            connection = url.openConnection() as HttpURLConnection
+            connection.apply {
+                requestMethod = "GET"
+                setRequestProperty("Content-Type", "application/json")
+                connectTimeout = 10000
+                readTimeout = 10000
+                doInput = true
+            }
+
+            val code = connection.responseCode
+            if (code == 200) {
+                val responseBody = connection.inputStream.bufferedReader().use { it.readText() }
+                Log.d(TAG, "✅ consultarphone ($code): $responseBody")
+                val response = Gson().fromJson(responseBody, AgenteResponse::class.java)
+                return if (response.value.isNotEmpty()) {
+                    Log.i(TAG, "✅ ${response.value.size} agente(s) encontrado(s) para $nro")
+                    response.value
+                } else {
+                    Log.w(TAG, "⚠️ No se encontraron agentes para $nro")
+                    null
+                }
+            } else {
+                val error = connection.errorStream?.bufferedReader()?.use { it.readText() } ?: ""
+                Log.e(TAG, "❌ Error consultarphone ($code): $error")
+                return null
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "❌ Error consultarphone: ${e.message}", e)
+            return null
+        } finally {
+            Log.d(TAG, "consultarphone finalizado en ${System.currentTimeMillis() - startTime}ms")
+            connection?.disconnect()
         }
     }
 

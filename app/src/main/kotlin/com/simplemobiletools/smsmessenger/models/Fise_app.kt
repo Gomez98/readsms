@@ -37,7 +37,10 @@ data class Agente(
     val U_LLG_ID_PARENT: String?,
 
     @SerializedName("U_LLG_APPROVE")
-    val U_LLG_APPROVE: String?
+    val U_LLG_APPROVE: String?,
+
+    @SerializedName("U_LLG_TEXT_SMS")
+    val U_LLG_TEXT_SMS: String?
 )
 
 /**
