@@ -15,4 +15,10 @@ dependencyResolutionManagement {
     }
 }
 
+includeBuild("../readsms-master/simple-commons") {
+    dependencySubstitution {
+        substitute(module("com.github.SimpleMobileTools:Simple-Commons")).using(project(":commons"))
+    }
+}
+
 include(":app")
