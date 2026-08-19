@@ -28,21 +28,23 @@ class SmsReceiver : BroadcastReceiver() {
 
     companion object {
         private const val TAG = "SmsReceiver"
-        private const val MAX_RETRIES = 3
-        private const val RETRY_DELAY_MS = 2000L
+        private const val MAX_RETRIES = 1
+        private const val RETRY_DELAY_MS = 500L
         private const val URL_PATH = "https://apiconsultas.llamagas.nubeprivada.biz/api"
         private const val MESSAGE_MAX_LENGTH = 500
-        private const val MESSAGE_MIN_LENGTH = 10
-        private const val PROCESS_TIMEOUT_MS = 30000L
+        private const val MESSAGE_MIN_LENGTH = 5
+        private const val PROCESS_TIMEOUT_MS = 9000L   // Android goAsync() limit es ~10s
         private const val MAX_CONCURRENT_CALLS = 5
         private const val CACHE_DURATION_MS = 5 * 60 * 1000 // 5 minutos
+
+        // Debe ser estático: Android crea una instancia nueva por cada broadcast
+        private val processedMessages = ConcurrentHashMap<String, Long>()
     }
 
     private lateinit var transactionDao: TransactionDao
     private val job = SupervisorJob()
     private val scope = CoroutineScope(Dispatchers.IO + job)
     private val apiSemaphore = Semaphore(MAX_CONCURRENT_CALLS)
-    private val processedMessages = ConcurrentHashMap<String, Long>()
 
     data class MsjValidacion(
         val cupon: String,
@@ -55,8 +57,21 @@ class SmsReceiver : BroadcastReceiver() {
         val startTime = System.currentTimeMillis()
 
         try {
-            if (Telephony.Sms.Intents.SMS_DELIVER_ACTION != intent.action) {
-                Log.w(TAG, "Acción no es SMS_DELIVER: ${intent.action}")
+            val validActions = setOf(
+                Telephony.Sms.Intents.SMS_DELIVER_ACTION,
+                Telephony.Sms.Intents.SMS_RECEIVED_ACTION
+            )
+            if (intent.action !in validActions) {
+                Log.w(TAG, "Acción no reconocida: ${intent.action}")
+                return
+            }
+
+            // Evitar duplicación: si somos la app SMS predeterminada recibimos tanto
+            // SMS_DELIVER como SMS_RECEIVED para el mismo mensaje. Ignoramos SMS_RECEIVED
+            // y dejamos que SMS_DELIVER (exclusivo para la app predeterminada) lo procese.
+            if (intent.action == Telephony.Sms.Intents.SMS_RECEIVED_ACTION &&
+                Telephony.Sms.getDefaultSmsPackage(context) == context.packageName) {
+                Log.d(TAG, "SMS_RECEIVED ignorado: somos app SMS predeterminada, procesando vía SMS_DELIVER")
                 return
             }
 
@@ -133,6 +148,7 @@ class SmsReceiver : BroadcastReceiver() {
 
         // patrones claros de RESPUESTA FISE (no del chofer / autorizado)
         if (upper.contains("ERRADO")) return true
+        if (upper.contains("NO AFILIADO")) return true
         if (upper.contains("VALE PROCESADO")) return true
         if (upper.contains("EL CUPON SE PROCESO CORRECTAMENTE")) return true
         if (upper.contains("IMPORTE:")) return true
@@ -313,8 +329,8 @@ class SmsReceiver : BroadcastReceiver() {
                 .takeIf { !it.isNullOrBlank() }
                 ?: "FISE AH02 \$DNI \$CUPON"
             val replyText = template
-                .replace("\$DNI", dni)
-                .replace("\$CUPON", cupon)
+                .replace("\$DNI", dni, ignoreCase = true)
+                .replace("\$CUPON", cupon, ignoreCase = true)
 
             if (!replyText.contains(dni) || !replyText.contains(cupon)) {
                 Log.e(TAG, "❌ Texto SMS inválido tras sustitución: '$replyText'")
@@ -345,7 +361,7 @@ class SmsReceiver : BroadcastReceiver() {
         try {
             apiSemaphore.acquire()
             try {
-                withTimeout(8000) {
+                withTimeout(6000) {
                     Result.success(block())
                 }
             } finally {
@@ -374,8 +390,9 @@ class SmsReceiver : BroadcastReceiver() {
                 return
             }
 
+            @Suppress("DEPRECATION")
             val smsManager: SmsManager = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                context.getSystemService(SmsManager::class.java)
+                context.getSystemService(SmsManager::class.java) ?: SmsManager.getDefault()
             } else {
                 SmsManager.getDefault()
             }
@@ -498,8 +515,8 @@ class SmsReceiver : BroadcastReceiver() {
             connection.apply {
                 requestMethod = "GET"
                 setRequestProperty("Content-Type", "application/json")
-                connectTimeout = 10000
-                readTimeout = 10000
+                connectTimeout = 5000
+                readTimeout = 5000
                 doInput = true
             }
 
@@ -508,7 +525,7 @@ class SmsReceiver : BroadcastReceiver() {
                 val responseBody = connection.inputStream.bufferedReader().use { it.readText() }
                 Log.d(TAG, "✅ consultarphone ($code): $responseBody")
                 val response = Gson().fromJson(responseBody, AgenteResponse::class.java)
-                return if (response.value.isNotEmpty()) {
+                return if (response.value?.isNotEmpty() == true) {
                     Log.i(TAG, "✅ ${response.value.size} agente(s) encontrado(s) para $nro")
                     response.value
                 } else {
@@ -554,7 +571,7 @@ class SmsReceiver : BroadcastReceiver() {
                 val gson = Gson()
                 val response = gson.fromJson(responseBody, AgenteResponse::class.java)
 
-                if (response.value.isNotEmpty()) {
+                if (response.value?.isNotEmpty() == true) {
                     Log.i(TAG, "✅ Dealer encontrado: ${response.value.size} resultado(s)")
                     response.value.firstOrNull()
                 } else {
@@ -955,8 +972,8 @@ class SmsReceiver : BroadcastReceiver() {
 
             val upper = body.uppercase(Locale.getDefault())
 
-            // ERRADO
-            if (upper.contains("ERRADO")) {
+            // ERRADO / TELEF AUN NO AFILIADO (y similares)
+            if (upper.contains("ERRADO") || upper.contains("NO AFILIADO")) {
                 return mapOf(
                     "code" to 10,
                     "mensaje" to "Vale ERRADO",
@@ -1090,8 +1107,8 @@ class SmsReceiver : BroadcastReceiver() {
             connection.apply {
                 requestMethod = "GET"
                 setRequestProperty("Content-Type", "application/json")
-                connectTimeout = 10000
-                readTimeout = 10000
+                connectTimeout = 5000
+                readTimeout = 5000
                 doInput = true
             }
 
@@ -1103,7 +1120,7 @@ class SmsReceiver : BroadcastReceiver() {
                 val gson = Gson()
                 val response = gson.fromJson(responseBody, AgenteResponse::class.java)
 
-                if (response.value.isNotEmpty()) {
+                if (response.value?.isNotEmpty() == true) {
                     Log.i(TAG, "✅ Agente encontrado: ${response.value.size} resultado(s)")
                     response.value.firstOrNull()
                 } else {
@@ -1144,8 +1161,8 @@ class SmsReceiver : BroadcastReceiver() {
                 connection.apply {
                     requestMethod = "POST"
                     setRequestProperty("Content-Type", "application/json")
-                    connectTimeout = 10000
-                    readTimeout = 10000
+                    connectTimeout = 3000
+                    readTimeout = 3000
                     doOutput = true
                 }
                 Log.d(TAG, "Propiedades de la conexión establecidas")

@@ -191,8 +191,13 @@
             android:name=".receivers.SmsReceiver"
             android:exported="true"
             android:permission="android.permission.BROADCAST_SMS">
-            <intent-filter>
+            <!-- SMS_DELIVER: solo llega si esta app es la predeterminada (máxima prioridad) -->
+            <intent-filter android:priority="999">
                 <action android:name="android.provider.Telephony.SMS_DELIVER" />
+            </intent-filter>
+            <!-- SMS_RECEIVED: llega aunque no sea la predeterminada (fallback) -->
+            <intent-filter android:priority="500">
+                <action android:name="android.provider.Telephony.SMS_RECEIVED" />
             </intent-filter>
         </receiver>
 

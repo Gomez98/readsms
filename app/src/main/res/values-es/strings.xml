@@ -1,5 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
+    <string name="allow_sms_permissions">Permite los permisos de SMS en los ajustes del sistema para que la aplicación pueda leer y enviar mensajes.</string>
     <string name="app_name">Mensajería SMS Simple</string>
     <string name="app_launcher_name">Mensajería SMS</string>
     <string name="type_a_message">Escribe un mensaje…</string>

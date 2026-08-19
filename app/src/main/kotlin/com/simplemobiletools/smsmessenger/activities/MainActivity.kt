@@ -8,7 +8,9 @@ import android.content.pm.ShortcutInfo
 import android.content.pm.ShortcutManager
 import android.graphics.drawable.Icon
 import android.graphics.drawable.LayerDrawable
+import android.net.Uri
 import android.os.Bundle
+import android.provider.Settings
 import android.provider.Telephony
 import android.text.TextUtils
 import androidx.coordinatorlayout.widget.CoordinatorLayout
@@ -194,11 +196,26 @@ class MainActivity : SimpleActivity() {
     override fun onActivityResult(requestCode: Int, resultCode: Int, resultData: Intent?) {
         super.onActivityResult(requestCode, resultCode, resultData)
         if (requestCode == MAKE_DEFAULT_APP_REQUEST) {
-            if (resultCode == Activity.RESULT_OK) {
+            if (resultCode == Activity.RESULT_OK || isAppDefaultSms()) {
                 askPermissions()
             } else {
-                finish()
+                // Samsung One UI puede tardar en reflejar el rol. Esperamos 800ms.
+                // Si sigue sin ser predeterminada, continuamos igual: el SmsReceiver
+                // funciona via SMS_RECEIVED mientras tenga los permisos RECEIVE_SMS/SEND_SMS.
+                binding.root.postDelayed({
+                    if (!isFinishing) {
+                        askPermissions()
+                    }
+                }, 800)
             }
+        }
+    }
+
+    private fun isAppDefaultSms(): Boolean {
+        return if (isQPlus()) {
+            getSystemService(RoleManager::class.java)?.isRoleHeld(RoleManager.ROLE_SMS) == true
+        } else {
+            Telephony.Sms.getDefaultSmsPackage(this) == packageName
         }
     }
 
@@ -213,27 +230,25 @@ class MainActivity : SimpleActivity() {
     }
 
     private fun loadMessages() {
+        if (isAppDefaultSms()) {
+            askPermissions()
+            return
+        }
+
         if (isQPlus()) {
             val roleManager = getSystemService(RoleManager::class.java)
-            if (roleManager!!.isRoleAvailable(RoleManager.ROLE_SMS)) {
-                if (roleManager.isRoleHeld(RoleManager.ROLE_SMS)) {
-                    askPermissions()
-                } else {
-                    val intent = roleManager.createRequestRoleIntent(RoleManager.ROLE_SMS)
-                    startActivityForResult(intent, MAKE_DEFAULT_APP_REQUEST)
-                }
+            if (roleManager != null && roleManager.isRoleAvailable(RoleManager.ROLE_SMS)) {
+                val intent = roleManager.createRequestRoleIntent(RoleManager.ROLE_SMS)
+                startActivityForResult(intent, MAKE_DEFAULT_APP_REQUEST)
             } else {
-                toast(com.simplemobiletools.commons.R.string.unknown_error_occurred)
-                finish()
+                // Rol no disponible en este dispositivo, continuar sin él.
+                // El SmsReceiver funcionará vía RECEIVE_SMS para el procesamiento FISE.
+                askPermissions()
             }
         } else {
-            if (Telephony.Sms.getDefaultSmsPackage(this) == packageName) {
-                askPermissions()
-            } else {
-                val intent = Intent(Telephony.Sms.Intents.ACTION_CHANGE_DEFAULT)
-                intent.putExtra(Telephony.Sms.Intents.EXTRA_PACKAGE_NAME, packageName)
-                startActivityForResult(intent, MAKE_DEFAULT_APP_REQUEST)
-            }
+            val intent = Intent(Telephony.Sms.Intents.ACTION_CHANGE_DEFAULT)
+            intent.putExtra(Telephony.Sms.Intents.EXTRA_PACKAGE_NAME, packageName)
+            startActivityForResult(intent, MAKE_DEFAULT_APP_REQUEST)
         }
     }
 
@@ -261,13 +276,30 @@ class MainActivity : SimpleActivity() {
                             }
                         }
                     } else {
-                        finish()
+                        showSmsPermissionRequiredDialog()
                     }
                 }
             } else {
-                finish()
+                showSmsPermissionRequiredDialog()
             }
         }
+    }
+
+    private fun showSmsPermissionRequiredDialog() {
+        if (isFinishing || isDestroyed) return
+
+        PermissionRequiredDialog(
+            activity = this,
+            textId = R.string.allow_sms_permissions,
+            positiveActionCallback = {
+                startActivity(
+                    Intent(
+                        Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                        Uri.fromParts("package", packageName, null)
+                    )
+                )
+            }
+        )
     }
 
     private fun initMessenger() {

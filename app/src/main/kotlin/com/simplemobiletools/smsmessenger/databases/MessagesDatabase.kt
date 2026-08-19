@@ -34,6 +34,7 @@ abstract class MessagesDatabase : RoomDatabase() {
     abstract fun TransactionDao(): TransactionDao
 
     companion object {
+        @Volatile
         private var db: MessagesDatabase? = null
 
         fun getInstance(context: Context): MessagesDatabase {
