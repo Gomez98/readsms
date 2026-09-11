@@ -2,10 +2,14 @@ package com.simplemobiletools.smsmessenger.models
 
 import androidx.room.ColumnInfo
 import androidx.room.Entity
+import androidx.room.Index
 import androidx.room.PrimaryKey
 import com.simplemobiletools.smsmessenger.helpers.*
 
-@Entity(tableName = TABLE_TX)
+@Entity(
+    tableName = TABLE_TX,
+    indices = [Index(value = [TX_OPERATION_ID], unique = true)]
+)
 data class Transaction(
     @PrimaryKey(autoGenerate = true)
     @ColumnInfo(name = TX_ID)
@@ -39,5 +43,11 @@ data class Transaction(
     var respuesta: String?,
 
     @ColumnInfo(name = TX_SN)
-    var sn: String? = null
+    var sn: String? = null,
+
+    @ColumnInfo(name = TX_ORIGIN, defaultValue = "'SMS'")
+    var origin: String = "SMS",
+
+    @ColumnInfo(name = TX_OPERATION_ID)
+    var operationId: String? = null
 )

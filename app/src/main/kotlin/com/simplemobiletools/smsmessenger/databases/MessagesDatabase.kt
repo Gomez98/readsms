@@ -17,7 +17,7 @@ import com.simplemobiletools.smsmessenger.models.*
     Message::class,
     RecycleBinMessage::class,
     MensajeFiltrado::class,
-    Transaction::class], version = 10)
+    Transaction::class], version = 11)
 @TypeConverters(Converters::class)
 abstract class MessagesDatabase : RoomDatabase() {
 
@@ -52,6 +52,7 @@ abstract class MessagesDatabase : RoomDatabase() {
                             .addMigrations(MIGRATION_7_8)
                             .addMigrations(MIGRATION_8_9)
                             .addMigrations(MIGRATION_9_10)
+                            .addMigrations(MIGRATION_10_11)
                             .build()
                     }
                 }
@@ -156,6 +157,14 @@ abstract class MessagesDatabase : RoomDatabase() {
         private val MIGRATION_9_10 = object : Migration(9, 10) {
             override fun migrate(database: SupportSQLiteDatabase) {
                 database.execSQL("ALTER TABLE transactions ADD COLUMN sn TEXT")
+            }
+        }
+
+        private val MIGRATION_10_11 = object : Migration(10, 11) {
+            override fun migrate(database: SupportSQLiteDatabase) {
+                database.execSQL("ALTER TABLE transactions ADD COLUMN origin TEXT NOT NULL DEFAULT 'SMS'")
+                database.execSQL("ALTER TABLE transactions ADD COLUMN operation_id TEXT")
+                database.execSQL("CREATE UNIQUE INDEX IF NOT EXISTS index_transactions_operation_id ON transactions(operation_id)")
             }
         }
     }

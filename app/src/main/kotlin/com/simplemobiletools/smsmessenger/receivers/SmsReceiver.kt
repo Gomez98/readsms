@@ -2,6 +2,7 @@ package com.simplemobiletools.smsmessenger.receivers
 
 import android.app.Application
 import android.content.BroadcastReceiver
+import android.content.BroadcastReceiver.PendingResult
 import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
@@ -36,6 +37,9 @@ class SmsReceiver : BroadcastReceiver() {
         private const val PROCESS_TIMEOUT_MS = 9000L   // Android goAsync() limit es ~10s
         private const val MAX_CONCURRENT_CALLS = 5
         private const val CACHE_DURATION_MS = 5 * 60 * 1000 // 5 minutos
+        const val LOCAL_REQUEST_ACTION = "pe.llamagas.readsms.PROCESS_FISE_REQUEST"
+        const val LOCAL_RESULT_ACTION = "pe.llamagas.fise.LOCAL_RESULT"
+        private const val PURPLE_APP_PACKAGE = "com.example.flutter_mobile_fise"
 
         // Debe ser estático: Android crea una instancia nueva por cada broadcast
         private val processedMessages = ConcurrentHashMap<String, Long>()
@@ -115,6 +119,65 @@ class SmsReceiver : BroadcastReceiver() {
         }
     }
 
+    internal fun processLocalRequest(
+        context: Context,
+        intent: Intent,
+        pendingResult: PendingResult
+    ) {
+        transactionDao = MessagesDatabase.getInstance(context).TransactionDao()
+        scope.launch {
+            try {
+                withTimeout(PROCESS_TIMEOUT_MS) {
+                    val operationId = intent.getStringExtra("operation_id").orEmpty()
+                    val requesterPhone = intent.getStringExtra("requester_phone").orEmpty()
+                    val sn = intent.getStringExtra("sn").orEmpty()
+                    val dni = intent.getStringExtra("dni").orEmpty()
+                    val cupon = intent.getStringExtra("cupon").orEmpty()
+                    transactionDao.expireOldPending()
+
+                    if (operationId.isBlank() || requesterPhone.isBlank() ||
+                        !Regex("C\\d{8,12}", RegexOption.IGNORE_CASE).matches(sn) ||
+                        !Regex("\\d{8}").matches(dni) ||
+                        !Regex("\\d{6,20}").matches(cupon)
+                    ) {
+                        sendLocalResult(context, requesterPhone, operationId,
+                            "Solicitud local inválida", "FAILED")
+                        return@withTimeout
+                    }
+
+                    if (transactionDao.getTxByOperationId(operationId) != null) {
+                        Log.w(TAG, "Solicitud local duplicada ignorada: $operationId")
+                        return@withTimeout
+                    }
+
+                    val agentes = safeApiCall("consultarphone-local") {
+                        consultarphone(requesterPhone)
+                    }.getOrNull()
+                    val agente = agentes?.firstOrNull()
+                    if (agente == null) {
+                        sendLocalResult(context, requesterPhone, operationId,
+                            "Remitente no registrado en el sistema", "FAILED")
+                        return@withTimeout
+                    }
+
+                    val body = "SN: $sn\nDNI: $dni\nCUPON: $cupon"
+                    val result = processFiseLogic(
+                        context, requesterPhone, body, agente, "LOCAL", operationId
+                    )
+                    if (result.isFailure) {
+                        sendLocalResult(context, requesterPhone, operationId,
+                            result.exceptionOrNull()?.message ?: "No se pudo procesar la solicitud",
+                            "FAILED")
+                    }
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "Error procesando solicitud local", e)
+            } finally {
+                pendingResult.finish()
+            }
+        }
+    }
+
     // 🔴 Reconstruimos el SMS completo (multi-parte)
     private suspend fun processMessages(
         context: Context,
@@ -166,6 +229,7 @@ class SmsReceiver : BroadcastReceiver() {
         val messageStartTime = System.currentTimeMillis()
 
         try {
+            transactionDao.expireOldPending()
             Log.i(TAG, "📨 De: $from, Mensaje: ${body.take(80)}...")
 
             if (body.length > MESSAGE_MAX_LENGTH || body.length < MESSAGE_MIN_LENGTH) {
@@ -173,7 +237,7 @@ class SmsReceiver : BroadcastReceiver() {
                 return
             }
 
-            val cacheKey = generateCacheKey(from, body)
+            val cacheKey = generateCacheKey(from, body, timestamp)
             if (isRecentlyProcessed(cacheKey)) {
                 Log.d(TAG, "Mensaje duplicado ignorado: $from")
                 return
@@ -218,8 +282,8 @@ class SmsReceiver : BroadcastReceiver() {
         }
     }
 
-    private fun generateCacheKey(from: String, body: String): String {
-        return "${from}_${body.hashCode()}"
+    private fun generateCacheKey(from: String, body: String, timestamp: Long): String {
+        return "${from}_${body.hashCode()}_$timestamp"
     }
 
     private fun isRecentlyProcessed(key: String): Boolean {
@@ -298,7 +362,9 @@ class SmsReceiver : BroadcastReceiver() {
         context: Context,
         from: String,
         body: String,
-        agente: Agente
+        agente: Agente,
+        origin: String = "SMS",
+        operationId: String? = null
     ): Result<Unit> {
         return try {
             Log.d(TAG, "🔍 Procesando lógica FISE")
@@ -316,10 +382,11 @@ class SmsReceiver : BroadcastReceiver() {
             val phoneDealer = agente.U_LLG_DEALER_PHONE
             if (phoneDealer.isNullOrBlank()) {
                 Log.w(TAG, "⚠️ Número FISE no configurado para el chofer $from")
-                val textoError = "No se pudo procesar el cupón por un problema de conexión. Inténtalo nuevamente."
-                sendSms(context, from, textoError)
-                saveOutgoingToTelephony(context, from, textoError)
-                return Result.failure(Exception("Número FISE no configurado"))
+                val textoError = "Número FISE no configurado para este agente."
+                if (origin != "LOCAL") {
+                    deliverResult(context, from, textoError, origin, operationId)
+                }
+                return Result.failure(Exception(textoError))
             }
 
             Log.i(TAG, "🏢 Número FISE destino: $phoneDealer")
@@ -345,7 +412,9 @@ class SmsReceiver : BroadcastReceiver() {
                 cupon = cupon,
                 dni = dni,
                 sn = sn,
-                agentePhone = agente.U_LLG_AGENT_PHONE
+                agentePhone = agente.U_LLG_AGENT_PHONE,
+                origin = origin,
+                operationId = operationId
             )
 
         } catch (e: Exception) {
@@ -404,6 +473,38 @@ class SmsReceiver : BroadcastReceiver() {
         }
     }
 
+    private fun sendLocalResult(
+        context: Context,
+        requesterPhone: String,
+        operationId: String,
+        body: String,
+        status: String
+    ) {
+        val resultIntent = Intent(LOCAL_RESULT_ACTION).apply {
+            setPackage(PURPLE_APP_PACKAGE)
+            putExtra("operation_id", operationId)
+            putExtra("requester_phone", requesterPhone)
+            putExtra("body", body)
+            putExtra("status", status)
+        }
+        context.sendBroadcast(resultIntent)
+    }
+
+    private fun deliverResult(
+        context: Context,
+        driverPhone: String,
+        body: String,
+        origin: String,
+        operationId: String?
+    ) {
+        if (origin == "LOCAL" && !operationId.isNullOrBlank()) {
+            sendLocalResult(context, driverPhone, operationId, body, "COMPLETED")
+        } else {
+            sendSms(context, driverPhone, body)
+            saveOutgoingToTelephony(context, driverPhone, body)
+        }
+    }
+
     /**
      * Aquí se envía el SMS a FISE/Entidad y se inserta la transacción en SQLite
      * como PENDING.
@@ -416,13 +517,12 @@ class SmsReceiver : BroadcastReceiver() {
         cupon: String,
         dni: String,
         sn: String?,
-        agentePhone: String?
+        agentePhone: String?,
+        origin: String = "SMS",
+        operationId: String? = null
     ): Result<Unit> {
         return try {
             Log.i(TAG, "📤 Enviando a FISE: $replyText → $phoneDealer")
-
-            sendSms(context, phoneDealer, replyText)
-            saveOutgoingToTelephony(context, phoneDealer, replyText)
 
             val transaction = Transaction(
                 driverPhone = from,                    // chofer/celular que envió el cupón
@@ -437,11 +537,16 @@ class SmsReceiver : BroadcastReceiver() {
                 monto = null,
                 estado = TxStatus.PENDING.toString(),
                 respuesta = null,
-                sn = sn                                   // 👈 se guarda tal cual llegó
+                sn = sn,
+                origin = origin,
+                operationId = operationId
             )
 
             saveTransaction(transaction)
             Log.i(TAG, "✅ Transacción guardada como PENDING")
+
+            sendSms(context, phoneDealer, replyText)
+            saveOutgoingToTelephony(context, phoneDealer, replyText)
             Result.success(Unit)
 
         } catch (e: Exception) {
@@ -708,9 +813,11 @@ class SmsReceiver : BroadcastReceiver() {
                 "Cupón $cupon validado correctamente."
             }
 
-            Log.i(TAG, "📤 Enviando a chofer $driverPhone: $textoChofer")
-            sendSms(context, driverPhone, textoChofer)
-            saveOutgoingToTelephony(context, driverPhone, textoChofer)
+            Log.i(TAG, "📤 Entregando resultado a $driverPhone: $textoChofer")
+            deliverResult(
+                context, driverPhone, textoChofer,
+                transaction.origin, transaction.operationId
+            )
 
         } catch (e: Exception) {
             Log.e(TAG, "❌ Error procesando mensaje válido", e)
@@ -842,11 +949,7 @@ class SmsReceiver : BroadcastReceiver() {
             val entidadKey = from.removePrefix("+51").trim()
 
             val tx = try {
-                val all = transactionDao.debugGetLastTransactions()
-                all.firstOrNull { t ->
-                    t.estado == TxStatus.PENDING.toString() &&
-                        t.entidad?.endsWith(entidadKey) == true
-                }
+                transactionDao.getLatestPendingByEntidad(entidadKey)
             } catch (e: Exception) {
                 Log.e(TAG, "❌ Error buscando transacción PENDING para entidad=$entidadKey", e)
                 null
@@ -877,9 +980,8 @@ class SmsReceiver : BroadcastReceiver() {
             }
 
             // Enviar al chofer EXACTAMENTE el mismo texto que mandó FISE
-            Log.i(TAG, "📤 Enviando al chofer $driverPhone el mensaje ERRADO de FISE")
-            sendSms(context, driverPhone, rawMessage)
-            saveOutgoingToTelephony(context, driverPhone, rawMessage)
+            Log.i(TAG, "📤 Entregando a $driverPhone el mensaje ERRADO de FISE")
+            deliverResult(context, driverPhone, rawMessage, tx.origin, tx.operationId)
 
         } catch (e: Exception) {
             Log.e(TAG, "❌ Error procesando mensaje errado", e)
@@ -911,11 +1013,7 @@ class SmsReceiver : BroadcastReceiver() {
             val entidadKey = from.removePrefix("+51").trim()
 
             val tx = try {
-                val all = transactionDao.debugGetLastTransactions()
-                all.firstOrNull { t ->
-                    t.estado == TxStatus.PENDING.toString() &&
-                        t.entidad?.endsWith(entidadKey) == true
-                }
+                transactionDao.getLatestPendingByEntidad(entidadKey)
             } catch (e: Exception) {
                 Log.e(TAG, "❌ Error buscando transacción PENDING para entidad=$entidadKey", e)
                 null
@@ -944,18 +1042,16 @@ class SmsReceiver : BroadcastReceiver() {
                 if (entidadUsada.isNotBlank()) append("\nENTIDAD: $entidadUsada")
             }
 
-            Log.i(TAG, "📤 Enviando al chofer $driverPhone el mensaje PROCESADO (con cupón real y entidad usada)")
-            sendSms(context, driverPhone, textoChofer)
-            saveOutgoingToTelephony(context, driverPhone, textoChofer)
+            Log.i(TAG, "📤 Entregando a $driverPhone el mensaje PROCESADO")
+            deliverResult(context, driverPhone, textoChofer, tx.origin, tx.operationId)
 
-            // (Opcional) si no quieres que quede PENDING eternamente, descomenta:
-            // transactionDao.updateTransaction(
-            //     cupon = tx.cupon,
-            //     dni = tx.dni,
-            //     estado = TxStatus.FAILED.toString(), // o PROCESSED si tienes ese estado
-            //     monto = null,
-            //     respuesta = rawMessage
-            // )
+            transactionDao.updateTransaction(
+                cupon = tx.cupon,
+                dni = tx.dni,
+                estado = TxStatus.PROCESSED.toString(),
+                monto = null,
+                respuesta = rawMessage
+            )
 
         } catch (e: Exception) {
             Log.e(TAG, "❌ Error procesando mensaje procesado", e)

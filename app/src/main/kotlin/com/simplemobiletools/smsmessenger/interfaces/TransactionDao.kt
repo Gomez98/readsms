@@ -27,26 +27,49 @@ interface TransactionDao {
         respuesta: String?
     ): Int
 
-    // ⬇️ Sin filtro de fecha, solo buscamos el último PENDING
+    // Solo hace match con una solicitud PENDING de la última hora.
     @Query("""
         SELECT * FROM transactions 
         WHERE cupon = :cupon 
           AND dni = :dni 
           AND estado = 'PENDING'
+          AND datetime(fecha) >= datetime('now', 'localtime', '-1 hour')
         ORDER BY fecha DESC
         LIMIT 1
     """)
     fun getTxByCuponAndDni(cupon: String, dni: String): Transaction?
 
-    // ⬇️ Igual para la búsqueda solo por cupón
+    // Fallback por cupón, con la misma vigencia máxima.
     @Query("""
         SELECT * FROM transactions 
         WHERE cupon = :cupon 
           AND estado = 'PENDING'
+          AND datetime(fecha) >= datetime('now', 'localtime', '-1 hour')
         ORDER BY fecha DESC
         LIMIT 1
     """)
     fun getTxByCuponOnly(cupon: String): Transaction?
+
+    @Query("SELECT * FROM transactions WHERE operation_id = :operationId LIMIT 1")
+    fun getTxByOperationId(operationId: String): Transaction?
+
+    @Query("""
+        SELECT * FROM transactions
+        WHERE estado = 'PENDING'
+          AND datetime(fecha) >= datetime('now', 'localtime', '-1 hour')
+          AND (entidad = :entidad OR entidad LIKE '%' || :entidad OR :entidad LIKE '%' || entidad)
+        ORDER BY fecha DESC
+        LIMIT 1
+    """)
+    fun getLatestPendingByEntidad(entidad: String): Transaction?
+
+    @Query("""
+        UPDATE transactions
+        SET estado = 'EXPIRED'
+        WHERE estado = 'PENDING'
+          AND datetime(fecha) < datetime('now', 'localtime', '-1 hour')
+    """)
+    fun expireOldPending(): Int
 
     // 👇 Método solo de debug, para ver lo que hay en la tabla
     @Query("""
